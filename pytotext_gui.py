@@ -144,27 +144,33 @@ def parse_fenced_code_cells(text: str) -> List[dict]:
     current_lines: List[str] = []
     in_fence = False
     fence_lines: List[str] = []
-    fence_open_line = "```python\n"
+    pending_spacing = ""
     cell_idx = 0
 
     for line in lines:
         stripped = line.strip()
         if not in_fence and FENCED_CODE_OPEN_RE.match(stripped):
-            # Flush any accumulated non-fence text as a markdown cell
+            # Check accumulated non-fence text
             if current_lines:
                 content = "".join(current_lines)
-                cell_idx += 1
-                cells.append({
-                    "cell_type": "markdown",
-                    "source": content,
-                    "cell_label": str(cell_idx),
-                    "hidden_prefix": "",
-                    "hidden_suffix": "",
-                    "is_fenced": False,
-                })
+                if content.strip():
+                    cell_idx += 1
+                    cells.append({
+                        "cell_type": "markdown",
+                        "source": content,
+                        "cell_label": str(cell_idx),
+                        "hidden_prefix": "",
+                        "hidden_suffix": "",
+                        "is_fenced": False,
+                    })
+                    pending_spacing = ""
+                else:
+                    # Pure whitespace / blank lines between cells -> attach as prefix to next fence
+                    pending_spacing = content
                 current_lines = []
             in_fence = True
-            fence_open_line = line if line.endswith("\n") else line + "\n"
+            fence_open_line = pending_spacing + (line if line.endswith("\n") else line + "\n")
+            pending_spacing = ""
             fence_lines = []
         elif in_fence and FENCED_CODE_CLOSE_RE.match(stripped):
             # End of fenced block → code cell
@@ -212,15 +218,19 @@ def parse_fenced_code_cells(text: str) -> List[dict]:
         })
     if current_lines:
         content = "".join(current_lines)
-        cell_idx += 1
-        cells.append({
-            "cell_type": "markdown",
-            "source": content,
-            "cell_label": str(cell_idx),
-            "hidden_prefix": "",
-            "hidden_suffix": "",
-            "is_fenced": False,
-        })
+        if content.strip():
+            cell_idx += 1
+            cells.append({
+                "cell_type": "markdown",
+                "source": content,
+                "cell_label": str(cell_idx),
+                "hidden_prefix": "",
+                "hidden_suffix": "",
+                "is_fenced": False,
+            })
+        elif cells:
+            # Trailing whitespace/newlines -> attach to last cell suffix so nothing is lost
+            cells[-1]["hidden_suffix"] += content
 
     return cells
 
