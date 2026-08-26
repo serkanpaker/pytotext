@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -827,6 +828,87 @@ class TextProcessWorker(QThread):
                 self.finished_signal.emit(parts, "Merged Content Splitting")
         except Exception as e:
             self.error_signal.emit(str(e))
+
+
+class UpdateCheckWorker(QThread):
+    check_finished = pyqtSignal(bool, str, str, str)  # (has_update, local_rev, remote_rev, error_message)
+    pull_finished = pyqtSignal(bool, str)  # (success, message)
+
+    def __init__(self, action: str = "check", repo_url: str = "https://github.com/serkanpaker/pytotext.git"):
+        super().__init__()
+        self.action = action
+        self.repo_url = repo_url
+
+    def run(self):
+        if self.action == "check":
+            try:
+                # 1. Query remote HEAD commit hash
+                res_remote = subprocess.run(
+                    ["git", "ls-remote", self.repo_url, "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if res_remote.returncode != 0:
+                    err = res_remote.stderr.strip() or "Could not reach remote repository."
+                    self.check_finished.emit(False, "", "", err)
+                    return
+
+                remote_lines = res_remote.stdout.strip().split()
+                if not remote_lines:
+                    self.check_finished.emit(False, "", "", "Empty response from remote repository.")
+                    return
+                remote_rev = remote_lines[0]
+
+                # 2. Get local HEAD commit hash if in a git repo
+                local_rev = ""
+                res_local = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=str(SCRIPT_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if res_local.returncode == 0:
+                    local_rev = res_local.stdout.strip()
+
+                if not local_rev:
+                    # Not a git clone or no local commit
+                    self.check_finished.emit(False, "", remote_rev, "LOCAL_NOT_GIT")
+                    return
+
+                has_update = (local_rev != remote_rev)
+                self.check_finished.emit(has_update, local_rev, remote_rev, "")
+            except Exception as e:
+                self.check_finished.emit(False, "", "", str(e))
+
+        elif self.action == "pull":
+            try:
+                # Try pull on main, fallback to master
+                res_pull = subprocess.run(
+                    ["git", "pull", "origin", "main", "--ff-only"],
+                    cwd=str(SCRIPT_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if res_pull.returncode != 0:
+                    res_pull = subprocess.run(
+                        ["git", "pull", "origin", "master", "--ff-only"],
+                        cwd=str(SCRIPT_DIR),
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+
+                if res_pull.returncode == 0:
+                    msg = res_pull.stdout.strip() or "Updated successfully."
+                    self.pull_finished.emit(True, msg)
+                else:
+                    err_msg = res_pull.stderr.strip() or res_pull.stdout.strip() or "Failed to pull updates."
+                    self.pull_finished.emit(False, err_msg)
+            except Exception as e:
+                self.pull_finished.emit(False, str(e))
 
 
 # --------------------------------------------------
@@ -1647,6 +1729,12 @@ class PyToTextMainWindow(QMainWindow):
         self.theme_combo.addItems(["◐ System", "☼ Light", "◑ Dark"])
         self.theme_combo.currentIndexChanged.connect(self._on_theme_combo_changed)
         layout.addWidget(self.theme_combo)
+
+        # Check for Updates Button
+        self.update_btn = QPushButton("🔄 Check Updates")
+        self.update_btn.setToolTip("Check for updates on GitHub (https://github.com/serkanpaker/pytotext.git)")
+        self.update_btn.clicked.connect(self._check_for_updates)
+        layout.addWidget(self.update_btn)
 
         # Settings Button (⚙ Settings)
         config_btn = QPushButton("⚙ Settings")
@@ -3539,6 +3627,96 @@ class PyToTextMainWindow(QMainWindow):
         except Exception as e:
             print(f"Error saving session on exit: {e}")
         event.accept()
+
+    # --------------------------------------------------
+    # Update Management
+    # --------------------------------------------------
+    def _check_for_updates(self):
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("🔄 Checking...")
+        self.statusBar().showMessage("Checking for updates from GitHub repository...", 5000)
+
+        self._update_worker = UpdateCheckWorker(action="check")
+        self._update_worker.check_finished.connect(self._on_update_check_finished)
+        self._update_worker.start()
+
+    def _on_update_check_finished(self, has_update: bool, local_rev: str, remote_rev: str, error_msg: str):
+        self.update_btn.setEnabled(True)
+        self.update_btn.setText("🔄 Check Updates")
+
+        if error_msg == "LOCAL_NOT_GIT":
+            short_remote = remote_rev[:7] if remote_rev else "latest"
+            msg = (
+                f"The application is running outside of a Git repository clone.\n\n"
+                f"Latest remote commit on GitHub is: {short_remote}\n"
+                f"Repository: https://github.com/serkanpaker/pytotext.git\n\n"
+                f"To enable automatic updates, clone the project using Git:\n"
+                f"git clone https://github.com/serkanpaker/pytotext.git"
+            )
+            QMessageBox.information(self, "Update Status", msg)
+            self.statusBar().showMessage("Update check complete: not a git clone.", 4000)
+            return
+
+        if error_msg:
+            QMessageBox.warning(self, "Update Check Error", f"Unable to check for updates:\n{error_msg}")
+            self.statusBar().showMessage("Failed to check for updates.", 4000)
+            return
+
+        if has_update:
+            short_local = local_rev[:7] if local_rev else "unknown"
+            short_remote = remote_rev[:7] if remote_rev else "unknown"
+            reply = QMessageBox.question(
+                self,
+                "Update Available",
+                f"A new update is available on GitHub!\n\n"
+                f"Current Local Version:  {short_local}\n"
+                f"Latest Remote Version: {short_remote}\n"
+                f"Repository: https://github.com/serkanpaker/pytotext.git\n\n"
+                f"Would you like to pull the latest changes now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._pull_latest_updates()
+        else:
+            short_local = local_rev[:7] if local_rev else "HEAD"
+            QMessageBox.information(
+                self,
+                "Up to Date",
+                f"PyToText is up to date!\n\n"
+                f"Current commit: {short_local}\n"
+                f"Repository: https://github.com/serkanpaker/pytotext.git",
+            )
+            self.statusBar().showMessage("PyToText is up to date.", 4000)
+
+    def _pull_latest_updates(self):
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("⬇ Updating...")
+        self.statusBar().showMessage("Pulling latest updates from GitHub...", 8000)
+
+        self._pull_worker = UpdateCheckWorker(action="pull")
+        self._pull_worker.pull_finished.connect(self._on_pull_finished)
+        self._pull_worker.start()
+
+    def _on_pull_finished(self, success: bool, msg: str):
+        self.update_btn.setEnabled(True)
+        self.update_btn.setText("🔄 Check Updates")
+
+        if success:
+            QMessageBox.information(
+                self,
+                "Update Complete",
+                f"PyToText was updated successfully!\n\n{msg}\n\nPlease restart the application to apply changes.",
+            )
+            self.statusBar().showMessage("Updated successfully. Restart app to apply.", 5000)
+        else:
+            QMessageBox.critical(
+                self,
+                "Update Failed",
+                f"Could not pull updates from repository:\n\n{msg}\n\nPlease check your internet connection or git status.",
+            )
+            self.statusBar().showMessage("Update failed.", 5000)
+
 
     def _save_config_file(self, target_path: Path):
         data = {
