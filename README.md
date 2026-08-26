@@ -6,12 +6,15 @@ It comes in two flavors:
 1. **Modern Desktop GUI** (`pytotext_gui.py`): A responsive PyQt6 application featuring Dark/Light themes, cell-level inspection for Jupyter Notebooks (`.ipynb`) and partitioned Python/Markdown files, live previews, column sorting, search/filter, and versatile multi-part chunking.
 2. **Interactive CLI** (`pytotext2.py`): A terminal-based shell for quickly navigating, selecting, filtering, and splitting files without a GUI.
 
+> **Note:** This program was designed and developed with the assistance of LLM coding agents including ChatGPT Codex, Claude Code, Antigravity, OpenCode, and others.
+
 ---
 
-## 🌟 Key Features
+## Key Features
 
 - **Multi-Format Ingestion**: Supports Python (`.py`), Jupyter Notebooks (`.ipynb`), Markdown (`.md`), Plain Text (`.txt`), YAML/JSON config files, CSV, HTML, and more.
 - **Smart Cell Extraction**: Automatically detects notebook cells (`.ipynb`) and notebook-like comment cells (`# %%`, `# %% [markdown]`, `Cell 1`, `cEll1`, etc.) in `.py` and `.md` files. You can select, filter, or export specific cell ranges.
+- **Jupyter-Style Cell Renderer**: Paste code containing cell markers (`# %%`, `# Cell`, ` ```python `) into the Quick Paste tab and render it as interactive Jupyter-like cells. Edit, copy, move, delete, and select individual cells.
 - **LLM Context Splitting Modes**:
   - **Single Merged File**: Concatenate all selected files into one document.
   - **Max Chars / Part**: Split merged content so no single output file exceeds your character limit (e.g. 100,000 chars).
@@ -27,6 +30,8 @@ It comes in two flavors:
   - Built-in multi-part preview tab with real-time character/word/line/token counters.
   - Copy directly to clipboard with a single click.
   - Export individual parts or batch-export all parts to a chosen folder.
+- **Undo / Redo**: Full undo/redo support (`Ctrl+Z` / `Cmd+Z` and `Ctrl+Y` / `Cmd+Y`) across all text editors.
+- **Auto-Update on Launch**: The launcher scripts automatically check for updates from the GitHub repository (if internet is available) and pull the latest version before starting the app.
 - **Modern UI / UX**:
   - Theme support (Dark, Light, and System modes).
   - Responsive layout (fits split-screen / half-screen tiling on macOS and Windows).
@@ -34,7 +39,7 @@ It comes in two flavors:
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```text
 Pytotext/
@@ -43,22 +48,22 @@ Pytotext/
 ├── pytotext_assets.py     # Embedded vector icons, logos, UI assets
 ├── requirements.txt       # Python package dependencies (PyQt6)
 ├── setup_env.command      # macOS/Linux automated environment setup
-├── run_gui.command        # macOS/Linux launcher
+├── run_gui.command        # macOS/Linux launcher (with auto-update)
 ├── setup_env.bat          # Windows automated virtual environment setup
-├── run_gui.bat            # Windows launcher
+├── run_gui.bat            # Windows launcher (with auto-update)
 └── README.md              # Project documentation
 ```
 
 ---
 
-## 📋 Prerequisites
+## Prerequisites
 
 - **Python 3.9+** (Python 3.10, 3.11, or 3.12 recommended)
 - **pip** package manager
 
 ---
 
-## 🚀 Quick Start & Installation
+## Quick Start & Installation
 
 ### Option 1: Automated Script Setup (Recommended)
 
@@ -75,7 +80,7 @@ Pytotext/
    *(Or double-click `setup_env.command` in macOS Finder)*.
 
 #### Windows
-1. Double-click `setup_env.bat` (or run `setup_env.bat` in Command Prompt / PowerShell).
+1. Double-click `setup_env.bat` in File Explorer (or run `setup_env.bat` in Command Prompt / PowerShell).
 
 ---
 
@@ -103,17 +108,17 @@ If you prefer to configure your environment manually:
 
 ---
 
-## 🖥️ Running the Application
+## Running the Application
 
 ### 1. Graphical User Interface (GUI)
 
 - **macOS / Linux:**
-  - Double-click `run_gui.command`, or run:
+  - **Double-click** `run_gui.command` in Finder to launch the app, or run:
     ```bash
     ./run_gui.command
     ```
 - **Windows:**
-  - Double-click `run_gui.bat`, or run:
+  - **Double-click** `run_gui.bat` in File Explorer to launch the app, or run:
     ```cmd
     run_gui.bat
     ```
@@ -121,6 +126,8 @@ If you prefer to configure your environment manually:
   ```bash
   python pytotext_gui.py
   ```
+
+> **Tip:** On macOS, if you get a "permission denied" error, run `chmod +x run_gui.command` once first.
 
 ---
 
@@ -144,7 +151,7 @@ python pytotext2.py
 
 ---
 
-## 📖 How to Use the GUI
+## How to Use the GUI
 
 1. **Open a Project Folder**:
    - Click **"Open Folder"** or press `Ctrl+O` / `Cmd+O` to select the root folder of your project.
@@ -154,18 +161,29 @@ python pytotext2.py
    - Click any column header (Name, Ext, Size, Cells) to sort your files.
 3. **Configure Cell Selections (Optional)**:
    - For `.ipynb` or cell-partitioned `.py`/`.md` files, click the cell count or choose specific cell ranges to omit unwanted outputs or exploratory scratchpads.
-4. **Choose Split Mode**:
+4. **Quick Paste & Jupyter Renderer**:
+   - Switch to the **"Quick Paste"** tab and paste raw code or text.
+   - If the pasted text contains cell markers (`# %%`, `# Cell`, ` ```python `), a **"Render Jupyter"** button appears.
+   - Click it to view the content as interactive Jupyter-style cells, where you can **edit**, **copy**, **move**, **delete**, and **select** individual cells.
+   - Click **"◀ Back to Editor"** to return to the raw text view.
+5. **Choose Split Mode**:
    - **Single File**: Combines everything into one file.
    - **Max Chars / Part**: Splits content at your chosen character ceiling (e.g., 100,000 characters).
    - **Max Tokens / Part**: Splits content based on token estimates for LLM context limits.
    - **Fixed N Parts**: Splits content evenly into $N$ files.
-5. **Preview & Export**:
+6. **Preview & Export**:
    - Click **"Generate & Preview"** (`Ctrl+G`) to inspect the merged parts in the live viewer.
    - Click **"Copy Part"** (`Ctrl+Shift+C`) to paste directly into your LLM chat window, or click **"Save Part / Save All Parts"** (`Ctrl+S` / `Ctrl+E`) to save to disk in `.txt`, `.py`, `.md`, or your preferred format.
 
 ---
 
-## 🛠️ Keyboard Shortcuts (GUI)
+## Auto-Update
+
+When you launch PyToText using `run_gui.command` (macOS/Linux) or `run_gui.bat` (Windows), the launcher automatically checks for updates from the GitHub repository. If an update is available and your internet connection is active, it pulls the latest version before starting the app. If you're offline or the project is not a git clone, the check is skipped silently.
+
+---
+
+## Keyboard Shortcuts (GUI)
 
 | Shortcut | Action |
 | :--- | :--- |
@@ -180,9 +198,12 @@ python pytotext2.py
 | `Ctrl+S` / `Cmd+S` | Save Active Part or Merged File |
 | `Ctrl+E` / `Cmd+E` | Export All Generated Output Files |
 | `Ctrl+T` / `Cmd+T` | Toggle Dark / Light / System Theme |
+| `Ctrl+Z` / `Cmd+Z` | Undo |
+| `Ctrl+Y` / `Cmd+Y` | Redo |
+| `Ctrl+Shift+Z` / `Cmd+Shift+Z` | Redo (alternative) |
 
 ---
 
-## 📄 License
+## License
 
 This project is open-source and free to use for personal and commercial development workflows.
