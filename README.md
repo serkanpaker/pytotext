@@ -30,7 +30,10 @@ It comes in two flavors:
   - Built-in multi-part preview tab with real-time character/word/line/token counters.
   - Copy directly to clipboard with a single click.
   - Export individual parts or batch-export all parts to a chosen folder.
-- **Undo / Redo**: Full undo/redo support (`Ctrl+Z` / `Cmd+Z` and `Ctrl+Y` / `Cmd+Y`) across all text editors.
+- **Expandable / Full-Width Sidebar**:
+  - Pull or drag the splitter divider to the right edge to expand the left panel to full width (100%), and pull back to restore split view.
+  - **Double-click** the splitter divider to instantly toggle between full width and split view.
+  - Dedicated **`⛶ Fullscreen Left`** header button and **`Cmd+B` / `Ctrl+B`** keyboard shortcut.
 - **In-App Update Checker**: A "🔄 Check Updates" button in the GUI header allows you to check for new commits on GitHub (`https://github.com/serkanpaker/pytotext.git`) and pull the latest changes on demand.
 - **Modern UI / UX**:
   - Theme support (Dark, Light, and System modes).
