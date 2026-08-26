@@ -62,6 +62,7 @@ try:
         QSizePolicy,
         QSpinBox,
         QSplitter,
+        QSplitterHandle,
         QStackedWidget,
         QStyle,
         QTabWidget,
@@ -943,11 +944,14 @@ def get_theme_stylesheet(mode: str) -> str:
         /* Splitters */
         QSplitter::handle {
             background-color: #19202e;
-            margin: 1px;
-            border-radius: 2px;
+            margin: 0px 1px;
+            border-radius: 3px;
         }
         QSplitter::handle:hover {
             background-color: #3b74f2;
+        }
+        QSplitter::handle:pressed {
+            background-color: #2557c7;
         }
 
         /* Segmented Tabs */
@@ -1112,11 +1116,14 @@ def get_theme_stylesheet(mode: str) -> str:
         /* Splitters */
         QSplitter::handle {
             background-color: #d9e1ec;
-            margin: 1px;
-            border-radius: 2px;
+            margin: 0px 1px;
+            border-radius: 3px;
         }
         QSplitter::handle:hover {
             background-color: #3267e6;
+        }
+        QSplitter::handle:pressed {
+            background-color: #1e4eb8;
         }
 
         /* Segmented Tabs */
@@ -1620,6 +1627,80 @@ class JupiterNotebookView(QWidget):
         return "\n\n".join(parts)
 
 
+class CollapsibleSplitterHandle(QSplitterHandle):
+    """
+    Enhanced splitter handle that supports:
+    - Double click to toggle full screen on the left pane
+    - Visual hover cursor
+    """
+    def __init__(self, orientation: Qt.Orientation, parent: QSplitter):
+        super().__init__(orientation, parent)
+        self.setCursor(Qt.CursorShape.SplitHCursor)
+
+    def mouseDoubleClickEvent(self, event):
+        splitter = self.splitter()
+        if isinstance(splitter, CollapsibleSplitter):
+            splitter.toggle_fullscreen()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+
+class CollapsibleSplitter(QSplitter):
+    """
+    A horizontal QSplitter that allows:
+    - Expanding the left pane to 100% full width
+    - Collapsing / restoring back to previous split proportions
+    - Snapping to full screen if pulled all the way to the right
+    """
+    fullscreen_toggled = pyqtSignal(bool)  # is_fullscreen
+
+    def __init__(self, orientation: Qt.Orientation = Qt.Orientation.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self.is_left_fullscreen = False
+        self.saved_sizes: List[int] = [320, 760]
+        self.splitterMoved.connect(self._on_splitter_moved)
+
+    def createHandle(self) -> QSplitterHandle:
+        return CollapsibleSplitterHandle(self.orientation(), self)
+
+    def toggle_fullscreen(self):
+        if not self.is_left_fullscreen:
+            # Save current non-maximized sizes if valid
+            current_sizes = self.sizes()
+            if len(current_sizes) >= 2 and current_sizes[1] > 20:
+                self.saved_sizes = current_sizes
+            
+            total = sum(self.sizes())
+            self.setSizes([total, 0])
+            self.is_left_fullscreen = True
+            self.fullscreen_toggled.emit(True)
+        else:
+            # Restore previous split proportions
+            if not self.saved_sizes or self.saved_sizes[1] <= 20:
+                total = sum(self.sizes())
+                left = min(max(320, int(total * 0.35)), total - 100)
+                self.saved_sizes = [left, total - left]
+            self.setSizes(self.saved_sizes)
+            self.is_left_fullscreen = False
+            self.fullscreen_toggled.emit(False)
+
+    def _on_splitter_moved(self, pos: int, index: int):
+        sizes = self.sizes()
+        if len(sizes) >= 2:
+            right_width = sizes[1]
+            total_width = sum(sizes)
+            # If pulled within 25px of the right edge, snap to full screen
+            if right_width <= 25 and not self.is_left_fullscreen:
+                self.is_left_fullscreen = True
+                self.fullscreen_toggled.emit(True)
+            elif right_width > 25 and self.is_left_fullscreen:
+                self.is_left_fullscreen = False
+                self.fullscreen_toggled.emit(False)
+            elif not self.is_left_fullscreen and right_width > 50:
+                self.saved_sizes = sizes
+
+
 # --------------------------------------------------
 # Main Window Class
 # --------------------------------------------------
@@ -1669,8 +1750,9 @@ class PyToTextMainWindow(QMainWindow):
         root_layout.addWidget(self._create_global_header())
 
         # 2. Main Outer Horizontal Splitter: Left Sidebar ↔ Right Workspace
-        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter = CollapsibleSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(True)
+        self.main_splitter.fullscreen_toggled.connect(self._on_sidebar_fullscreen_toggled)
 
         # Left Sidebar Pane
         self.left_sidebar = self._create_left_sidebar_panel()
@@ -1723,6 +1805,12 @@ class PyToTextMainWindow(QMainWindow):
         layout.addLayout(brand_layout)
 
         layout.addStretch()
+
+        # Left Window Fullscreen / Split Toggle Button
+        self.sidebar_toggle_btn = QPushButton("⛶ Fullscreen Left")
+        self.sidebar_toggle_btn.setToolTip("Expand left window to full screen or restore split view (Cmd+B / Ctrl+B, or double-click divider)")
+        self.sidebar_toggle_btn.clicked.connect(self._toggle_left_sidebar_fullscreen)
+        layout.addWidget(self.sidebar_toggle_btn)
 
         # Appearance dropdown (◐ System ▾)
         self.theme_combo = QComboBox()
@@ -2453,6 +2541,27 @@ class PyToTextMainWindow(QMainWindow):
         ])
         redo_act.triggered.connect(self._redo_focused_editor)
         self.addAction(redo_act)
+
+        # Toggle Left Sidebar Fullscreen (Ctrl+B / Cmd+B)
+        toggle_sidebar_act = QAction(self)
+        toggle_sidebar_act.setShortcuts([QKeySequence("Ctrl+B"), QKeySequence("Meta+B")])
+        toggle_sidebar_act.triggered.connect(self._toggle_left_sidebar_fullscreen)
+        self.addAction(toggle_sidebar_act)
+
+    def _toggle_left_sidebar_fullscreen(self):
+        if hasattr(self, "main_splitter"):
+            self.main_splitter.toggle_fullscreen()
+
+    def _on_sidebar_fullscreen_toggled(self, is_fullscreen: bool):
+        if hasattr(self, "sidebar_toggle_btn"):
+            if is_fullscreen:
+                self.sidebar_toggle_btn.setText("↔ Restore Split")
+                self.sidebar_toggle_btn.setToolTip("Restore split layout (Cmd+B / Ctrl+B, or double-click divider)")
+                self.statusBar().showMessage("Left window expanded to full width. Press Cmd+B or double-click divider to restore.", 4000)
+            else:
+                self.sidebar_toggle_btn.setText("⛶ Fullscreen Left")
+                self.sidebar_toggle_btn.setToolTip("Expand left window to full screen (Cmd+B / Ctrl+B, or double-click divider)")
+                self.statusBar().showMessage("Split layout restored.", 3000)
 
     def _get_focused_editor(self) -> Optional[QPlainTextEdit]:
         """Return the QPlainTextEdit that currently has keyboard focus, if any."""
