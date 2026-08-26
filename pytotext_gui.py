@@ -143,6 +143,7 @@ def parse_fenced_code_cells(text: str) -> List[dict]:
     in_fence = False
     fence_lines: List[str] = []
     fence_open_line = "```python\n"
+    inter_fence_spacing = ""
     cell_idx = 0
 
     for line in lines:
@@ -161,18 +162,30 @@ def parse_fenced_code_cells(text: str) -> List[dict]:
                         "hidden_suffix": "",
                         "is_fenced": False,
                     })
+                    inter_fence_spacing = ""
+                else:
+                    # Whitespace / blank lines between fences
+                    inter_fence_spacing = content
                 current_lines = []
             in_fence = True
-            fence_open_line = line if line.endswith("\n") else line + "\n"
+            fence_open_line = (inter_fence_spacing + line) if line.endswith("\n") else (inter_fence_spacing + line + "\n")
+            inter_fence_spacing = ""
             fence_lines = []
         elif in_fence and FENCED_CODE_CLOSE_RE.match(stripped):
             # End of fenced block → code cell
             cell_idx += 1
             fence_close_line = line if line.endswith("\n") else line + "\n"
+            explicit_label = None
+            for f_line in fence_lines:
+                match = CELL_NUM_EXTRACT_RE.search(f_line)
+                if match:
+                    explicit_label = match.group(1)
+                    break
+
             cells.append({
                 "cell_type": "code",
                 "source": "".join(fence_lines),
-                "cell_label": str(cell_idx),
+                "cell_label": explicit_label or str(cell_idx),
                 "hidden_prefix": fence_open_line,
                 "hidden_suffix": fence_close_line,
                 "is_fenced": True,
@@ -187,10 +200,17 @@ def parse_fenced_code_cells(text: str) -> List[dict]:
     # Flush remaining
     if in_fence and fence_lines:
         cell_idx += 1
+        explicit_label = None
+        for f_line in fence_lines:
+            match = CELL_NUM_EXTRACT_RE.search(f_line)
+            if match:
+                explicit_label = match.group(1)
+                break
+
         cells.append({
             "cell_type": "code",
             "source": "".join(fence_lines),
-            "cell_label": str(cell_idx),
+            "cell_label": explicit_label or str(cell_idx),
             "hidden_prefix": fence_open_line,
             "hidden_suffix": "```\n",
             "is_fenced": True,
@@ -225,7 +245,7 @@ def is_cell_or_banner_marker_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
-    return is_unified_cell_marker_line(line) or bool(BANNER_LINE_RE.match(stripped))
+    return is_unified_cell_marker_line(line) or bool(BANNER_LINE_RE.match(stripped)) or bool(FENCED_CODE_OPEN_RE.match(stripped))
 
 
 def extract_unified_cell_label(header_line: str) -> Optional[str]:
@@ -305,20 +325,29 @@ def parse_unified_cells(text: str, is_markdown: bool = False) -> List[dict]:
                 cell_type = "markdown"
                 break
 
-        # Separate hidden markers (# %%, <!-- cell -->) from visible header lines (e.g. # Cell)
+        # Separate hidden markers (# %%, <!-- cell -->, ```python) from visible header lines (e.g. # Cell)
         cluster_lines = lines[m_start:m_end]
         hidden_prefix_lines = []
         visible_header_lines = []
         for cline in cluster_lines:
             cstripped = cline.strip()
-            if cstripped.startswith("# %%") or cstripped.startswith("<!-- cell"):
+            if cstripped.startswith("# %%") or cstripped.startswith("<!-- cell") or FENCED_CODE_OPEN_RE.match(cstripped):
                 hidden_prefix_lines.append(cline)
             else:
                 visible_header_lines.append(cline)
 
         body_lines = lines[m_end:next_start]
-        visible_source = "".join(visible_header_lines + body_lines)
+        hidden_suffix_lines = []
+        clean_body_lines = []
+        for bline in body_lines:
+            if FENCED_CODE_CLOSE_RE.match(bline.strip()):
+                hidden_suffix_lines.append(bline)
+            else:
+                clean_body_lines.append(bline)
+
+        visible_source = "".join(visible_header_lines + clean_body_lines)
         hidden_prefix = "".join(hidden_prefix_lines)
+        hidden_suffix = "".join(hidden_suffix_lines)
 
         cells.append({
             "cell_type": cell_type,
@@ -327,7 +356,7 @@ def parse_unified_cells(text: str, is_markdown: bool = False) -> List[dict]:
             "from_markers": True,
             "cell_label": explicit_label or str(idx + 1),
             "hidden_prefix": hidden_prefix,
-            "hidden_suffix": "",
+            "hidden_suffix": hidden_suffix,
         })
 
     return cells
@@ -1332,6 +1361,29 @@ class JupiterCellWidget(QFrame):
 
         layout.addWidget(self.editor)
 
+    def set_markers_visible(self, visible: bool):
+        """Toggle whether hidden syntax markers (fences, # %%) are shown in the cell editor."""
+        current_text = self.editor.toPlainText()
+        if visible:
+            # Expand to show hidden prefix and suffix
+            prefix_to_add = self.hidden_prefix if not current_text.startswith(self.hidden_prefix) else ""
+            suffix_to_add = self.hidden_suffix if not current_text.endswith(self.hidden_suffix) else ""
+            new_text = prefix_to_add + current_text + suffix_to_add
+            self.editor.setPlainText(new_text)
+        else:
+            # Strip hidden prefix and suffix from current text
+            new_text = current_text
+            if self.hidden_prefix and new_text.startswith(self.hidden_prefix):
+                new_text = new_text[len(self.hidden_prefix):]
+            if self.hidden_suffix and new_text.endswith(self.hidden_suffix):
+                new_text = new_text[:-len(self.hidden_suffix)]
+            self.editor.setPlainText(new_text)
+
+        # Auto-adjust height
+        line_count = max(2, self.editor.toPlainText().count("\n") + 1)
+        line_height = self.editor.fontMetrics().lineSpacing()
+        self.editor.setFixedHeight(min(line_count * line_height + 16, 400))
+
     def _copy_cell(self):
         QApplication.clipboard().setText(self.editor.toPlainText())
         # Brief flash feedback
@@ -1345,9 +1397,11 @@ class JupiterCellWidget(QFrame):
         """Returns visible editor content."""
         return self.editor.toPlainText()
 
-    def get_reconstructed_content(self) -> str:
+    def get_reconstructed_content(self, markers_visible: bool = False) -> str:
         """Returns full content with hidden markers reconstructed."""
         text = self.editor.toPlainText()
+        if markers_visible:
+            return text
         return self.hidden_prefix + text + self.hidden_suffix
 
     def is_selected(self) -> bool:
@@ -1360,6 +1414,7 @@ class JupiterNotebookView(QWidget):
 
     def __init__(self, cells: List[dict], parent=None):
         super().__init__(parent)
+        self.markers_visible = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -1377,6 +1432,13 @@ class JupiterNotebookView(QWidget):
         copy_selected_btn.setObjectName("primaryActionBtn")
         copy_selected_btn.clicked.connect(self._copy_selected)
         toolbar.addWidget(copy_selected_btn)
+
+        # Show / Hide Syntax Markers Toggle Button
+        self.toggle_markers_btn = QPushButton("Show Markers")
+        self.toggle_markers_btn.setCheckable(True)
+        self.toggle_markers_btn.setToolTip("Toggle visibility of # %%, ```python, and cell markers in editor cards")
+        self.toggle_markers_btn.clicked.connect(self._toggle_markers_visibility)
+        toolbar.addWidget(self.toggle_markers_btn)
 
         toolbar.addStretch()
 
@@ -1450,6 +1512,14 @@ class JupiterNotebookView(QWidget):
             self.cell_layout.addWidget(cw)
         self.cell_layout.addStretch()
 
+    def _toggle_markers_visibility(self):
+        """Toggle whether hidden syntax markers (```python, # %%) are shown in all cell editors."""
+        self.markers_visible = not self.markers_visible
+        self.toggle_markers_btn.setText("Hide Markers" if self.markers_visible else "Show Markers")
+        self.toggle_markers_btn.setChecked(self.markers_visible)
+        for cw in self.cell_widgets:
+            cw.set_markers_visible(self.markers_visible)
+
     def _delete_cell(self, cell_widget: JupiterCellWidget):
         if cell_widget in self.cell_widgets:
             self.cell_widgets.remove(cell_widget)
@@ -1459,7 +1529,7 @@ class JupiterNotebookView(QWidget):
 
     def _go_back(self):
         """Reconstruct text from cells with all hidden markers preserved and emit back signal."""
-        parts = [cw.get_reconstructed_content() for cw in self.cell_widgets]
+        parts = [cw.get_reconstructed_content(markers_visible=self.markers_visible) for cw in self.cell_widgets]
         reconstructed = "".join(parts)
         self.back_to_editor_signal.emit(reconstructed)
 
@@ -2937,12 +3007,11 @@ class PyToTextMainWindow(QMainWindow):
         if not txt.strip():
             return
 
-        # Determine parser: if fenced code blocks present and no unified markers, use fenced parser;
+        # Determine parser: if fenced code blocks present, use fenced parser;
         # otherwise use the unified cell parser
         has_fenced = any(FENCED_CODE_OPEN_RE.match(line.strip()) for line in txt.splitlines() if line.strip())
-        has_unified = any(UNIFIED_CELL_MARKER_RE.match(line.strip()) for line in txt.splitlines() if line.strip())
 
-        if has_fenced and not has_unified:
+        if has_fenced:
             cells = parse_fenced_code_cells(txt)
         else:
             cells = parse_unified_cells(txt)
