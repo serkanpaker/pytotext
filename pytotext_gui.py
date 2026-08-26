@@ -145,7 +145,6 @@ def parse_fenced_code_cells(text: str) -> List[dict]:
     in_fence = False
     fence_lines: List[str] = []
     fence_open_line = "```python\n"
-    inter_fence_spacing = ""
     cell_idx = 0
 
     for line in lines:
@@ -154,29 +153,23 @@ def parse_fenced_code_cells(text: str) -> List[dict]:
             # Flush any accumulated non-fence text as a markdown cell
             if current_lines:
                 content = "".join(current_lines)
-                if content.strip():
-                    cell_idx += 1
-                    cells.append({
-                        "cell_type": "markdown",
-                        "source": content,
-                        "cell_label": str(cell_idx),
-                        "hidden_prefix": "",
-                        "hidden_suffix": "",
-                        "is_fenced": False,
-                    })
-                    inter_fence_spacing = ""
-                else:
-                    # Whitespace / blank lines between fences
-                    inter_fence_spacing = content
+                cell_idx += 1
+                cells.append({
+                    "cell_type": "markdown",
+                    "source": content,
+                    "cell_label": str(cell_idx),
+                    "hidden_prefix": "",
+                    "hidden_suffix": "",
+                    "is_fenced": False,
+                })
                 current_lines = []
             in_fence = True
-            fence_open_line = (inter_fence_spacing + line) if line.endswith("\n") else (inter_fence_spacing + line + "\n")
-            inter_fence_spacing = ""
+            fence_open_line = line if line.endswith("\n") else line + "\n"
             fence_lines = []
         elif in_fence and FENCED_CODE_CLOSE_RE.match(stripped):
             # End of fenced block → code cell
             cell_idx += 1
-            fence_close_line = line if line.endswith("\n") else line + "\n"
+            fence_close_line = line
             explicit_label = None
             for f_line in fence_lines:
                 match = CELL_NUM_EXTRACT_RE.search(f_line)
@@ -219,16 +212,15 @@ def parse_fenced_code_cells(text: str) -> List[dict]:
         })
     if current_lines:
         content = "".join(current_lines)
-        if content.strip():
-            cell_idx += 1
-            cells.append({
-                "cell_type": "markdown",
-                "source": content,
-                "cell_label": str(cell_idx),
-                "hidden_prefix": "",
-                "hidden_suffix": "",
-                "is_fenced": False,
-            })
+        cell_idx += 1
+        cells.append({
+            "cell_type": "markdown",
+            "source": content,
+            "cell_label": str(cell_idx),
+            "hidden_prefix": "",
+            "hidden_suffix": "",
+            "is_fenced": False,
+        })
 
     return cells
 
@@ -292,6 +284,7 @@ def parse_unified_cells(text: str, is_markdown: bool = False) -> List[dict]:
             "cell_label": "1" if is_markdown else None,
             "hidden_prefix": "",
             "hidden_suffix": "",
+            "is_fenced": False,
         }]
 
     cells: List[dict] = []
@@ -307,6 +300,7 @@ def parse_unified_cells(text: str, is_markdown: bool = False) -> List[dict]:
                 "cell_label": "0",
                 "hidden_prefix": "",
                 "hidden_suffix": "",
+                "is_fenced": False,
             })
 
     for idx, (m_start, m_end) in enumerate(clusters):
@@ -359,6 +353,7 @@ def parse_unified_cells(text: str, is_markdown: bool = False) -> List[dict]:
             "cell_label": explicit_label or str(idx + 1),
             "hidden_prefix": hidden_prefix,
             "hidden_suffix": hidden_suffix,
+            "is_fenced": bool(hidden_suffix_lines) or any(FENCED_CODE_OPEN_RE.match(l.strip()) for l in hidden_prefix_lines),
         })
 
     return cells
@@ -1377,6 +1372,7 @@ class JupiterCellWidget(QFrame):
     move_up_signal = pyqtSignal(object)
     move_down_signal = pyqtSignal(object)
     delete_signal = pyqtSignal(object)
+    add_below_signal = pyqtSignal(object, str)  # (self, cell_type: "code" | "markdown")
 
     def __init__(self, cell_data: dict, index: int, parent=None):
         super().__init__(parent)
@@ -1384,6 +1380,7 @@ class JupiterCellWidget(QFrame):
         self.cell_index = index
         self.hidden_prefix = cell_data.get("hidden_prefix", "")
         self.hidden_suffix = cell_data.get("hidden_suffix", "")
+        self.is_fenced = cell_data.get("is_fenced", False)
         self.setObjectName("jupiterCell")
         self.setFrameShape(QFrame.Shape.StyledPanel)
 
@@ -1406,8 +1403,8 @@ class JupiterCellWidget(QFrame):
         label_text = cell_data.get("cell_label", str(index + 1))
         type_badge = "Code" if cell_type == "code" else "Markdown"
 
-        label = QLabel(f"<b>Cell {label_text}</b>")
-        header_layout.addWidget(label)
+        self.label = QLabel(f"<b>Cell {label_text}</b>")
+        header_layout.addWidget(self.label)
 
         badge = QLabel(type_badge)
         badge.setObjectName("cellTypeBadge")
@@ -1426,6 +1423,18 @@ class JupiterCellWidget(QFrame):
         copy_btn.setToolTip("Copy cell content")
         copy_btn.clicked.connect(self._copy_cell)
         header_layout.addWidget(copy_btn)
+
+        add_code_btn = QPushButton("+ Code")
+        add_code_btn.setFixedHeight(24)
+        add_code_btn.setToolTip("Add code cell below")
+        add_code_btn.clicked.connect(lambda: self.add_below_signal.emit(self, "code"))
+        header_layout.addWidget(add_code_btn)
+
+        add_md_btn = QPushButton("+ MD")
+        add_md_btn.setFixedHeight(24)
+        add_md_btn.setToolTip("Add markdown cell below")
+        add_md_btn.clicked.connect(lambda: self.add_below_signal.emit(self, "markdown"))
+        header_layout.addWidget(add_md_btn)
 
         up_btn = QPushButton("▲")
         up_btn.setFixedSize(28, 24)
@@ -1460,24 +1469,30 @@ class JupiterCellWidget(QFrame):
         self.editor.setFont(font)
         self.editor.document().setDefaultFont(font)
 
-        # Auto-size: minimum 2 lines, grow with content
-        line_count = max(2, self.raw_source.count("\n") + 1)
+        self._adjust_editor_height()
+        self.editor.textChanged.connect(self._adjust_editor_height)
+
+        layout.addWidget(self.editor)
+
+    def _adjust_editor_height(self):
+        line_count = max(2, self.editor.toPlainText().count("\n") + 1)
         line_height = self.editor.fontMetrics().lineSpacing()
         self.editor.setFixedHeight(min(line_count * line_height + 16, 400))
 
-        layout.addWidget(self.editor)
+    def update_index(self, index: int):
+        self.cell_index = index
+        label_text = self.cell_data.get("cell_label") or str(index + 1)
+        self.label.setText(f"<b>Cell {label_text}</b>")
 
     def set_markers_visible(self, visible: bool):
         """Toggle whether hidden syntax markers (fences, # %%) are shown in the cell editor."""
         current_text = self.editor.toPlainText()
         if visible:
-            # Expand to show hidden prefix and suffix
             prefix_to_add = self.hidden_prefix if not current_text.startswith(self.hidden_prefix) else ""
             suffix_to_add = self.hidden_suffix if not current_text.endswith(self.hidden_suffix) else ""
             new_text = prefix_to_add + current_text + suffix_to_add
             self.editor.setPlainText(new_text)
         else:
-            # Strip hidden prefix and suffix from current text
             new_text = current_text
             if self.hidden_prefix and new_text.startswith(self.hidden_prefix):
                 new_text = new_text[len(self.hidden_prefix):]
@@ -1485,14 +1500,10 @@ class JupiterCellWidget(QFrame):
                 new_text = new_text[:-len(self.hidden_suffix)]
             self.editor.setPlainText(new_text)
 
-        # Auto-adjust height
-        line_count = max(2, self.editor.toPlainText().count("\n") + 1)
-        line_height = self.editor.fontMetrics().lineSpacing()
-        self.editor.setFixedHeight(min(line_count * line_height + 16, 400))
+        self._adjust_editor_height()
 
     def _copy_cell(self):
         QApplication.clipboard().setText(self.editor.toPlainText())
-        # Brief flash feedback
         sender = self.sender()
         if sender:
             original = sender.text()
@@ -1508,7 +1519,28 @@ class JupiterCellWidget(QFrame):
         text = self.editor.toPlainText()
         if markers_visible:
             return text
-        return self.hidden_prefix + text + self.hidden_suffix
+
+        prefix = self.hidden_prefix
+        suffix = self.hidden_suffix
+
+        # Ensure fenced code blocks properly format prefix/suffix
+        if self.is_fenced:
+            if not prefix:
+                prefix = "```python\n"
+            if not suffix:
+                suffix = "```\n"
+
+            # Cell body inside fences needs trailing newline before closing fence if not empty
+            body = text
+            if body and not body.endswith("\n"):
+                body = body + "\n"
+            return prefix + body + suffix
+
+        # Unified cell / marker cell formatting
+        body = text
+        if suffix and not body.endswith("\n"):
+            body = body + "\n"
+        return prefix + body + suffix
 
     def is_selected(self) -> bool:
         return self.select_cb.isChecked()
@@ -1538,6 +1570,17 @@ class JupiterNotebookView(QWidget):
         copy_selected_btn.setObjectName("primaryActionBtn")
         copy_selected_btn.clicked.connect(self._copy_selected)
         toolbar.addWidget(copy_selected_btn)
+
+        # Add Code / Markdown at end buttons
+        add_code_btn = QPushButton("+ Code Cell")
+        add_code_btn.setToolTip("Add a new code cell at the bottom")
+        add_code_btn.clicked.connect(lambda: self._add_cell(cell_type="code"))
+        toolbar.addWidget(add_code_btn)
+
+        add_md_btn = QPushButton("+ Markdown Cell")
+        add_md_btn.setToolTip("Add a new markdown cell at the bottom")
+        add_md_btn.clicked.connect(lambda: self._add_cell(cell_type="markdown"))
+        toolbar.addWidget(add_md_btn)
 
         # Show / Hide Syntax Markers Toggle Button
         self.toggle_markers_btn = QPushButton("Show Markers")
@@ -1571,16 +1614,75 @@ class JupiterNotebookView(QWidget):
 
         self.cell_widgets: List[JupiterCellWidget] = []
         for i, cell_data in enumerate(cells):
-            cw = JupiterCellWidget(cell_data, i)
-            cw.move_up_signal.connect(self._move_cell_up)
-            cw.move_down_signal.connect(self._move_cell_down)
-            cw.delete_signal.connect(self._delete_cell)
-            self.cell_widgets.append(cw)
-            self.cell_layout.addWidget(cw)
+            self._insert_cell_widget(cell_data, i)
 
         self.cell_layout.addStretch()
         scroll.setWidget(self.cell_container)
         layout.addWidget(scroll, 1)
+
+    def _insert_cell_widget(self, cell_data: dict, index: int) -> JupiterCellWidget:
+        cw = JupiterCellWidget(cell_data, index)
+        cw.move_up_signal.connect(self._move_cell_up)
+        cw.move_down_signal.connect(self._move_cell_down)
+        cw.delete_signal.connect(self._delete_cell)
+        cw.add_below_signal.connect(self._add_cell_below)
+        self.cell_widgets.insert(index, cw)
+        self._rebuild_layout()
+        return cw
+
+    def _rebuild_layout(self):
+        while self.cell_layout.count():
+            item = self.cell_layout.takeAt(0)
+            # Do not delete widget, just unparent from layout
+        for i, cw in enumerate(self.cell_widgets):
+            cw.update_index(i)
+            self.cell_layout.addWidget(cw)
+        self.cell_layout.addStretch()
+        self.cell_count_label.setText(f"{len(self.cell_widgets)} cells")
+
+    def _add_cell(self, cell_type: str = "code"):
+        """Add cell at the bottom of the list."""
+        self._add_cell_below(self.cell_widgets[-1] if self.cell_widgets else None, cell_type=cell_type)
+
+    def _add_cell_below(self, cell_widget: Optional[JupiterCellWidget], cell_type: str = "code"):
+        insert_idx = len(self.cell_widgets)
+        if cell_widget in self.cell_widgets:
+            insert_idx = self.cell_widgets.index(cell_widget) + 1
+
+        is_fenced = True
+        if self.cell_widgets:
+            is_fenced = self.cell_widgets[0].is_fenced
+
+        if is_fenced:
+            if cell_type == "code":
+                new_data = {
+                    "cell_type": "code",
+                    "source": "",
+                    "cell_label": str(insert_idx + 1),
+                    "hidden_prefix": "\n```python\n",
+                    "hidden_suffix": "```\n",
+                    "is_fenced": True,
+                }
+            else:
+                new_data = {
+                    "cell_type": "markdown",
+                    "source": "\n",
+                    "cell_label": str(insert_idx + 1),
+                    "hidden_prefix": "",
+                    "hidden_suffix": "",
+                    "is_fenced": False,
+                }
+        else:
+            new_data = {
+                "cell_type": cell_type,
+                "source": "",
+                "cell_label": str(insert_idx + 1),
+                "hidden_prefix": "\n# %%\n" if cell_type == "code" else "\n# %% [markdown]\n",
+                "hidden_suffix": "",
+                "is_fenced": False,
+            }
+
+        self._insert_cell_widget(new_data, insert_idx)
 
     def _toggle_select_all(self, state):
         checked = state == Qt.CheckState.Checked.value
@@ -1596,27 +1698,19 @@ class JupiterNotebookView(QWidget):
         idx = self.cell_widgets.index(cell_widget)
         if idx <= 0:
             return
-        self._swap_cells(idx, idx - 1)
+        self.cell_widgets[idx], self.cell_widgets[idx - 1] = (
+            self.cell_widgets[idx - 1], self.cell_widgets[idx]
+        )
+        self._rebuild_layout()
 
     def _move_cell_down(self, cell_widget: JupiterCellWidget):
         idx = self.cell_widgets.index(cell_widget)
         if idx >= len(self.cell_widgets) - 1:
             return
-        self._swap_cells(idx, idx + 1)
-
-    def _swap_cells(self, idx_a: int, idx_b: int):
-        # Swap in list
-        self.cell_widgets[idx_a], self.cell_widgets[idx_b] = (
-            self.cell_widgets[idx_b], self.cell_widgets[idx_a]
+        self.cell_widgets[idx], self.cell_widgets[idx + 1] = (
+            self.cell_widgets[idx + 1], self.cell_widgets[idx]
         )
-
-        # Rebuild layout order
-        for i in range(self.cell_layout.count()):
-            self.cell_layout.takeAt(0)
-
-        for cw in self.cell_widgets:
-            self.cell_layout.addWidget(cw)
-        self.cell_layout.addStretch()
+        self._rebuild_layout()
 
     def _toggle_markers_visibility(self):
         """Toggle whether hidden syntax markers (```python, # %%) are shown in all cell editors."""
@@ -1631,7 +1725,7 @@ class JupiterNotebookView(QWidget):
             self.cell_widgets.remove(cell_widget)
             self.cell_layout.removeWidget(cell_widget)
             cell_widget.deleteLater()
-            self.cell_count_label.setText(f"{len(self.cell_widgets)} cells")
+            self._rebuild_layout()
 
     def _go_back(self):
         """Reconstruct text from cells with all hidden markers preserved and emit back signal."""
