@@ -885,28 +885,45 @@ class UpdateCheckWorker(QThread):
 
         elif self.action == "pull":
             try:
-                # Try pull on main, fallback to master
-                res_pull = subprocess.run(
-                    ["git", "pull", "origin", "main", "--ff-only"],
+                # 1. Fetch latest changes from remote
+                res_fetch = subprocess.run(
+                    ["git", "fetch", "origin"],
                     cwd=str(SCRIPT_DIR),
                     capture_output=True,
                     text=True,
                     timeout=30,
                 )
-                if res_pull.returncode != 0:
-                    res_pull = subprocess.run(
-                        ["git", "pull", "origin", "master", "--ff-only"],
-                        cwd=str(SCRIPT_DIR),
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
+                if res_fetch.returncode != 0:
+                    err = res_fetch.stderr.strip() or res_fetch.stdout.strip() or "Failed to fetch from remote origin."
+                    self.pull_finished.emit(False, err)
+                    return
+
+                # 2. Identify current local branch
+                branch_res = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=str(SCRIPT_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                curr_branch = branch_res.stdout.strip() if branch_res.returncode == 0 else "main"
+                if not curr_branch or curr_branch == "HEAD":
+                    curr_branch = "main"
+
+                # 3. Pull / fast-forward against the active tracking branch
+                res_pull = subprocess.run(
+                    ["git", "pull", "--ff-only", "origin", curr_branch],
+                    cwd=str(SCRIPT_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
 
                 if res_pull.returncode == 0:
                     msg = res_pull.stdout.strip() or "Updated successfully."
                     self.pull_finished.emit(True, msg)
                 else:
-                    err_msg = res_pull.stderr.strip() or res_pull.stdout.strip() or "Failed to pull updates."
+                    err_msg = res_pull.stderr.strip() or res_pull.stdout.strip() or "Failed to fast-forward local branch."
                     self.pull_finished.emit(False, err_msg)
             except Exception as e:
                 self.pull_finished.emit(False, str(e))
