@@ -31,7 +31,7 @@ It comes in two flavors:
   - Copy directly to clipboard with a single click.
   - Export individual parts or batch-export all parts to a chosen folder.
 - **Undo / Redo**: Full undo/redo support (`Ctrl+Z` / `Cmd+Z` and `Ctrl+Y` / `Cmd+Y`) across all text editors.
-- **Auto-Update on Launch**: The launcher scripts automatically check for updates from the GitHub repository (if internet is available) and pull the latest version before starting the app.
+- **In-App Update Checker**: A "🔄 Check Updates" button in the GUI header allows you to check for new commits on GitHub (`https://github.com/serkanpaker/pytotext.git`) and pull the latest changes on demand.
 - **Modern UI / UX**:
   - Theme support (Dark, Light, and System modes).
   - Responsive layout (fits split-screen / half-screen tiling on macOS and Windows).
@@ -48,9 +48,9 @@ Pytotext/
 ├── pytotext_assets.py     # Embedded vector icons, logos, UI assets
 ├── requirements.txt       # Python package dependencies (PyQt6)
 ├── setup_env.command      # macOS/Linux automated environment setup
-├── run_gui.command        # macOS/Linux launcher (with auto-update)
+├── run_gui.command        # macOS/Linux app launcher
 ├── setup_env.bat          # Windows automated virtual environment setup
-├── run_gui.bat            # Windows launcher (with auto-update)
+├── run_gui.bat            # Windows app launcher
 └── README.md              # Project documentation
 ```
 
