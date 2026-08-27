@@ -180,12 +180,6 @@ python pytotext2.py
 
 ---
 
-## Auto-Update
-
-When you launch PyToText using `run_gui.command` (macOS/Linux) or `run_gui.bat` (Windows), the launcher automatically checks for updates from the GitHub repository. If an update is available and your internet connection is active, it pulls the latest version before starting the app. If you're offline or the project is not a git clone, the check is skipped silently.
-
----
-
 ## Keyboard Shortcuts (GUI)
 
 | Shortcut | Action |
