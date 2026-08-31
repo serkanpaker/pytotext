@@ -7,6 +7,8 @@ It comes in two flavors:
 2. **Interactive CLI** (`pytotext2.py`): A terminal-based shell for quickly navigating, selecting, filtering, and splitting files without a GUI.
 
 > **Note:** This program was designed and developed with the assistance of LLM coding agents including ChatGPT Codex, Claude Code, Antigravity, OpenCode, and others.
+<img width="1917" height="1075" alt="Screenshot 2026-08-31 130841" src="https://github.com/user-attachments/assets/0b0b1f92-b6a6-466d-9a8c-9f002281961d" />
+<img width="1917" height="1075" alt="Screenshot 2026-08-31 130715" src="https://github.com/user-attachments/assets/7db380ba-df9b-4dbd-b7b3-cd392c4959e6" />
 
 ---
 
