@@ -278,6 +278,9 @@ def render_ipynb(
 # --------------------------------------------------
 # Notebook-like .py parsing
 # --------------------------------------------------
+BANNER_LINE_RE = re.compile(r"^\s*#\s*={5,}\s*$")
+NOTEBOOK_TITLE_RE = re.compile(r"#\s*.*notebook\b.*", re.IGNORECASE)
+
 PY_CELL_MARKER_RE = re.compile(
     r"""
     ^
@@ -285,14 +288,14 @@ PY_CELL_MARKER_RE = re.compile(
     (?:
         \#\s*%%(?:\s*\[[^\]]+\])?      # # %% or # %% [code]
         |
-        \#\s*cell\s*\d+.*$             # # Cell 1 / # cell1: / # Cell 0: TUM IMPORTS
+        \#\s{0,3}cell\s*-?\d+[a-z]?\b(?!\s*[\)\]\,])(?:\s*[:\-—]|\s+[A-Za-z0-9_]|\s*$)
     )
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
 PY_CELL_LABEL_RE = re.compile(
-    r"#\s*cell\s*(\d+[a-z]?)\b",
+    r"#\s*cell\s*(-?\d+[a-z]?)\b(?!\s*[\)\]\,])",
     re.IGNORECASE,
 )
 
@@ -312,22 +315,86 @@ def is_py_cell_marker_line(line: str) -> bool:
     return bool(PY_CELL_MARKER_RE.match(stripped))
 
 
+def is_py_banner_header_start(lines: List[str], i: int) -> Tuple[bool, int, Optional[str], str]:
+    if not BANNER_LINE_RE.match(lines[i].strip()):
+        return False, 0, None, "code"
+
+    for j in range(i + 1, min(len(lines), i + 6)):
+        s = lines[j].strip()
+        if BANNER_LINE_RE.match(s):
+            inner = lines[i + 1:j]
+            if not inner or not all(line.strip().startswith("#") for line in inner):
+                return False, 0, None, "code"
+
+            for line in inner:
+                m_cell = PY_CELL_LABEL_RE.search(line)
+                if m_cell:
+                    return True, j + 1, normalize_cell_label(m_cell.group(1)), "code"
+
+            for line in inner:
+                if NOTEBOOK_TITLE_RE.search(line):
+                    title = line.strip().lstrip("#").strip()[:40]
+                    return True, j + 1, title, "markdown"
+                if "[markdown]" in line.lower() or "[md]" in line.lower():
+                    title = line.strip().lstrip("#").strip()[:40]
+                    return True, j + 1, title, "markdown"
+
+            return False, 0, None, "code"
+        elif not s.startswith("#") and s:
+            break
+
+    return False, 0, None, "code"
+
+
 def parse_py_cells(path: Path) -> List[dict]:
     """
     Split a .py file into notebook-like cells if cell marker lines exist.
-
-    Rules:
-    - If no markers are found, return one synthetic code cell containing whole file.
-    - A marker line starts a new cell and is included inside that cell.
-    - Lines before the first marker become a preamble cell if they contain any non-empty text.
-    - If markers have explicit numbers (e.g. '# Cell 8:'), use those as cell indices.
     """
     text = read_text_best_effort(path)
     lines = text.splitlines(keepends=True)
+    if not lines:
+        return []
 
-    marker_positions = [i for i, line in enumerate(lines) if is_py_cell_marker_line(line)]
+    boundaries: List[Tuple[int, int, Optional[str], str]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
 
-    if not marker_positions:
+        if stripped.startswith("# %%"):
+            cell_type = "markdown" if "[markdown]" in stripped.lower() or "[md]" in stripped.lower() else "code"
+            ahead = i + 1
+            while ahead < len(lines) and not lines[ahead].strip():
+                ahead += 1
+            if ahead < len(lines):
+                is_bh, end_bh, lbl, ctype = is_py_banner_header_start(lines, ahead)
+                if is_bh:
+                    boundaries.append((i, end_bh, lbl, cell_type if cell_type == "markdown" else ctype))
+                    i = end_bh
+                    continue
+            boundaries.append((i, i + 1, None, cell_type))
+            i += 1
+            continue
+
+        is_bh, end_bh, lbl, ctype = is_py_banner_header_start(lines, i)
+        if is_bh:
+            boundaries.append((i, end_bh, lbl, ctype))
+            i = end_bh
+            continue
+
+        if is_py_cell_marker_line(line):
+            lbl = extract_cell_label_from_marker(line)
+            if i + 1 < len(lines) and BANNER_LINE_RE.match(lines[i + 1].strip()):
+                boundaries.append((i, i + 2, lbl, "code"))
+                i += 2
+            else:
+                boundaries.append((i, i + 1, lbl, "code"))
+                i += 1
+            continue
+
+        i += 1
+
+    if not boundaries:
         return [{
             "cell_type": "code",
             "source": text,
@@ -337,46 +404,86 @@ def parse_py_cells(path: Path) -> List[dict]:
         }]
 
     cells: List[dict] = []
-
-    first_marker = marker_positions[0]
-    preamble_cell = None
-    if first_marker > 0:
-        preamble = "".join(lines[:first_marker])
-        if preamble.strip():
-            preamble_cell = {
+    first_b_start = boundaries[0][0]
+    if first_b_start > 0:
+        preamble_lines = lines[:first_b_start]
+        clean_preamble = [l for l in preamble_lines if not l.strip().startswith("```")]
+        preamble_text = "".join(clean_preamble)
+        if preamble_text.strip():
+            cells.append({
                 "cell_type": "code",
-                "source": preamble,
+                "source": preamble_text if preamble_text.endswith("\n") else preamble_text + "\n",
                 "synthetic_single_cell": False,
                 "from_markers": True,
-                "cell_label": None,
-            }
+                "cell_label": "0",
+            })
 
-    # Build cells from markers
-    marker_cells = []
-    starts = marker_positions
-    ends = marker_positions[1:] + [len(lines)]
+    for idx, (b_start, b_end, expl_lbl, c_type) in enumerate(boundaries):
+        next_b_start = boundaries[idx + 1][0] if idx + 1 < len(boundaries) else len(lines)
 
-    for start, end in zip(starts, ends):
-        chunk = "".join(lines[start:end])
-        cell_type = infer_py_cell_type_from_header(lines[start])
-        cell_label = extract_cell_label_from_marker(lines[start])
-        source_text = chunk
-        output_text = ""
-        if cell_type == "code":
-            source_text, output_text = split_code_and_trailing_output(chunk)
-        marker_cells.append({
-            "cell_type": cell_type,
-            "source": source_text,
-            "output_text": output_text,
-            "synthetic_single_cell": False,
-            "from_markers": True,
-            "cell_label": cell_label,
-        })
+        cluster_lines = lines[b_start:b_end]
+        raw_body_lines = lines[b_end:next_b_start]
 
-    cells: List[dict] = []
-    if preamble_cell:
-        cells.append(preamble_cell)
-    cells.extend(marker_cells)
+        code_lines = []
+        interstitial_md_lines = []
+        in_interstitial = False
+
+        k = 0
+        while k < len(raw_body_lines):
+            bline = raw_body_lines[k]
+            bstripped = bline.strip()
+
+            if bstripped == "```":
+                rem = raw_body_lines[k + 1:]
+                non_fence_text = [l for l in rem if not l.strip().startswith("```")]
+                if any(l.strip() for l in non_fence_text):
+                    in_interstitial = True
+                    k += 1
+                    continue
+                else:
+                    k += 1
+                    continue
+
+            if in_interstitial:
+                if bstripped.startswith("```"):
+                    in_interstitial = False
+                else:
+                    interstitial_md_lines.append(bline)
+            else:
+                if not bstripped.startswith("```"):
+                    code_lines.append(bline)
+            k += 1
+
+        visible_code = "".join(cluster_lines + code_lines)
+        clean_lines = [l for l in visible_code.splitlines(keepends=True) if not l.strip().startswith("```")]
+        clean_source = "".join(clean_lines)
+        if clean_source.strip():
+            if not clean_source.endswith("\n"):
+                clean_source += "\n"
+            source_text = clean_source
+            output_text = ""
+            if c_type == "code":
+                source_text, output_text = split_code_and_trailing_output(clean_source)
+            cells.append({
+                "cell_type": c_type,
+                "source": source_text,
+                "output_text": output_text,
+                "synthetic_single_cell": False,
+                "from_markers": True,
+                "cell_label": expl_lbl or str(idx + 1),
+            })
+
+        clean_md = [l for l in interstitial_md_lines if not l.strip().startswith("```")]
+        md_source = "".join(clean_md).strip()
+        if md_source:
+            cells.append({
+                "cell_type": "markdown",
+                "source": md_source + "\n\n",
+                "output_text": "",
+                "synthetic_single_cell": False,
+                "from_markers": True,
+                "cell_label": f"Note {len(cells)}",
+            })
 
     return cells
 
