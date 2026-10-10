@@ -518,12 +518,16 @@ def parse_quick_paste_cells(text: str) -> List[dict]:
     uses parse_unified_cells so each cell is partitioned accurately.
     Falls back to parse_fenced_code_cells only for purely fenced markdown blocks.
     """
-    if has_cell_markers_or_banners(text):
-        return parse_unified_cells(text)
     txt_lines = text.splitlines(keepends=True)
     has_fenced = any(FENCED_CODE_OPEN_RE.match(line.strip()) for line in txt_lines if line.strip())
     if has_fenced:
-        return parse_fenced_code_cells(text)
+        # Fences are the real cell boundaries; banner/# Cell comments inside
+        # code must not split or merge cells.
+        cells = parse_fenced_code_cells(text)
+        if cells:
+            return cells
+    if has_cell_markers_or_banners(text):
+        return parse_unified_cells(text)
     return parse_unified_cells(text)
 
 
@@ -602,6 +606,12 @@ def parse_md_cells(path_or_text: Path | str) -> List[dict]:
         text = pytotext2.read_text_best_effort(path_or_text)
     else:
         text = str(path_or_text)
+    # Markdown with fenced code blocks: one cell per fence (comments inside
+    # code must never be treated as markdown headings / cell markers).
+    if any(FENCED_CODE_OPEN_RE.match(l.strip()) for l in text.splitlines() if l.strip()):
+        cells = parse_fenced_code_cells(text)
+        if cells:
+            return cells
     return parse_unified_cells(text, is_markdown=True)
 
 
@@ -810,11 +820,20 @@ def split_text_balanced(
     current_len = 0
     current_part_idx = 0
 
+    in_fence = False
+    fence_open_text = "```python\n"
+    has_fences = any(FENCED_CODE_OPEN_RE.match(l.strip()) for l in lines)
+
     for i, line in enumerate(lines):
         if cancel_check and i % 2000 == 0 and cancel_check():
             return []
 
         line_len = line_lengths[i]
+        _s = line.strip()
+        fence_start = False
+        if has_fences:
+            if not in_fence and FENCED_CODE_OPEN_RE.match(_s):
+                fence_start = True
         remaining_parts_count = max(1, total_target_parts - len(parts))
 
         if coefficients_str.strip():
@@ -833,6 +852,10 @@ def split_text_balanced(
             or line.startswith("# ---")
             or line.startswith("## ")
         )
+        if has_fences:
+            # Only break between cells: at a fence opener (outside code) or
+            # on markdown text outside any fence. Never on comments in code.
+            is_cell_break = fence_start if not in_fence else False
 
         soft_threshold = int(target_limit * 0.985)
         hard_limit = min(target_limit, max_chars) if effective_mode == "maxchars" else target_limit
@@ -856,15 +879,28 @@ def split_text_balanced(
                         should_roll = True
 
         if should_roll:
+            if has_fences and in_fence:
+                # Hard split inside a code cell: close and reopen the fence.
+                current_chunk.append("```\n")
             part_str = "".join(current_chunk)
             parts.append(part_str)
             remaining_total_chars -= len(part_str)
             current_chunk = []
             current_len = 0
             current_part_idx += 1
+            if has_fences and in_fence:
+                current_chunk.append(fence_open_text)
+                current_len += len(fence_open_text)
 
         current_chunk.append(line)
         current_len += line_len
+
+        if has_fences:
+            if not in_fence and FENCED_CODE_OPEN_RE.match(_s):
+                in_fence = True
+                fence_open_text = line if line.endswith("\n") else line + "\n"
+            elif in_fence and FENCED_CODE_CLOSE_RE.match(_s):
+                in_fence = False
 
     if current_chunk:
         parts.append("".join(current_chunk))
