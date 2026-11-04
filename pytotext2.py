@@ -152,7 +152,32 @@ def notebook_cells(path: Path) -> List[dict]:
     cells = data.get("cells", [])
     if not isinstance(cells, list):
         raise ValueError("Notebook 'cells' field is not a list.")
-    return cells
+
+    # Clean up any isolated divider-only cells by merging into the subsequent cell
+    merged_cells = []
+    i = 0
+    while i < len(cells):
+        cell = cells[i]
+        if isinstance(cell, dict):
+            src = cell.get("source", [])
+            src_str = "".join(str(x) for x in src) if isinstance(src, list) else str(src)
+            non_empty = [l for l in src_str.splitlines() if l.strip()]
+            if len(non_empty) == 1 and BANNER_LINE_RE.match(non_empty[0]):
+                if i + 1 < len(cells) and isinstance(cells[i + 1], dict):
+                    next_cell = cells[i + 1]
+                    divider = non_empty[0] + "\n"
+                    next_src = next_cell.get("source", [])
+                    next_str = "".join(str(x) for x in next_src) if isinstance(next_src, list) else str(next_src)
+                    if not next_str.strip().startswith(non_empty[0]):
+                        if isinstance(next_cell.get("source"), list):
+                            next_cell["source"] = [divider] + next_cell["source"]
+                        else:
+                            next_cell["source"] = divider + next_str
+                    i += 1
+                    continue
+        merged_cells.append(cell)
+        i += 1
+    return merged_cells
 
 
 def summarize_ipynb_cells(path: Path, preview_len: int = 90) -> List[str]:
@@ -278,7 +303,7 @@ def render_ipynb(
 # --------------------------------------------------
 # Notebook-like .py parsing
 # --------------------------------------------------
-BANNER_LINE_RE = re.compile(r"^\s*#\s*={5,}\s*$")
+BANNER_LINE_RE = re.compile(r"^\s*#\s*[-=]{5,}\s*$")
 NOTEBOOK_TITLE_RE = re.compile(r"#\s*.*notebook\b.*", re.IGNORECASE)
 
 PY_CELL_MARKER_RE = re.compile(
@@ -485,7 +510,26 @@ def parse_py_cells(path: Path) -> List[dict]:
                 "cell_label": f"Note {len(cells)}",
             })
 
-    return cells
+    # Clean up any isolated divider-only cells by merging them into the subsequent cell
+    cleaned_cells: List[dict] = []
+    ci = 0
+    while ci < len(cells):
+        c = cells[ci]
+        src = c.get("source", "")
+        lines_non_empty = [l for l in src.splitlines() if l.strip()]
+        if len(lines_non_empty) == 1 and BANNER_LINE_RE.match(lines_non_empty[0]):
+            if ci + 1 < len(cells):
+                next_c = cells[ci + 1]
+                divider = lines_non_empty[0] + "\n"
+                next_src = next_c.get("source", "")
+                if not next_src.strip().startswith(lines_non_empty[0]):
+                    next_c["source"] = divider + next_src
+                ci += 1
+                continue
+        cleaned_cells.append(c)
+        ci += 1
+
+    return cleaned_cells
 
 
 def infer_py_cell_type_from_header(header_line: str) -> str:
