@@ -14,6 +14,7 @@ Refined per user request:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -50,6 +51,7 @@ try:
         QHBoxLayout,
         QHeaderView,
         QLabel,
+        QLayout,
         QLineEdit,
         QMainWindow,
         QMenu,
@@ -118,12 +120,13 @@ UNIFIED_CELL_MARKER_RE = re.compile(
 )
 
 CELL_NUM_EXTRACT_RE = re.compile(r"#\s*cell\s*(-?\d+[a-z]?)\b(?!\s*[\)\]\,])", re.IGNORECASE)
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 # Fenced code block markers (```python / ```)
 FENCED_CODE_OPEN_RE = re.compile(r"^\s*```(?:python|py|python3)?\s*$", re.IGNORECASE)
 FENCED_CODE_CLOSE_RE = re.compile(r"^\s*```\s*$")
 
-BANNER_LINE_RE = re.compile(r"^\s*#\s*={5,}\s*$")
+BANNER_LINE_RE = re.compile(r"^\s*#\s*[-=]{5,}\s*$")
 NOTEBOOK_TITLE_RE = re.compile(r"#\s*.*notebook\b.*", re.IGNORECASE)
 
 
@@ -173,8 +176,22 @@ def is_banner_header_start(lines: List[str], i: int) -> Tuple[bool, int]:
     return is_bh, end_idx
 
 
+def is_ipynb_json(text: str) -> bool:
+    """Return True if text appears to be a Jupyter Notebook (.ipynb) JSON document."""
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return False
+    try:
+        data = json.loads(stripped)
+        return isinstance(data, dict) and "cells" in data and isinstance(data["cells"], list)
+    except Exception:
+        return False
+
+
 def has_jupyter_markers(text: str) -> bool:
-    """Return True if text contains any Jupyter-like cell markers."""
+    """Return True if text contains any Jupyter-like cell markers or is a Jupyter notebook JSON."""
+    if is_ipynb_json(text):
+        return True
     lines = text.splitlines(keepends=True)
     for idx, line in enumerate(lines):
         stripped = line.strip()
@@ -323,14 +340,20 @@ def parse_unified_cells(text: str, is_markdown: bool = False) -> List[dict]:
 
         # 1. Explicit # %% marker
         if stripped.startswith("# %%"):
-            cell_type = "markdown" if "[markdown]" in stripped.lower() or "[md]" in stripped.lower() else "code"
+            s_lower = stripped.lower()
+            if "[output]" in s_lower or "[out]" in s_lower:
+                cell_type = "output"
+            elif "[markdown]" in s_lower or "[md]" in s_lower:
+                cell_type = "markdown"
+            else:
+                cell_type = "code"
             ahead = i + 1
             while ahead < len(lines) and not lines[ahead].strip():
                 ahead += 1
             if ahead < len(lines):
                 is_bh, end_bh, lbl, ctype = is_cell_banner_header_start(lines, ahead)
                 if is_bh:
-                    clusters.append((i, end_bh, lbl, cell_type if cell_type == "markdown" else ctype))
+                    clusters.append((i, end_bh, lbl, cell_type if cell_type in ("markdown", "output") else ctype))
                     i = end_bh
                     continue
             clusters.append((i, i + 1, None, cell_type))
@@ -443,7 +466,10 @@ def parse_unified_cells(text: str, is_markdown: bool = False) -> List[dict]:
         cell_type = c_type
         for cline in cluster_lines:
             c_lower = cline.lower()
-            if "<!-- cell" in c_lower or "[markdown]" in c_lower or "[md]" in c_lower:
+            if "[output]" in c_lower or "[out]" in c_lower:
+                cell_type = "output"
+                break
+            elif "<!-- cell" in c_lower or "[markdown]" in c_lower or "[md]" in c_lower:
                 cell_type = "markdown"
                 break
 
@@ -493,7 +519,26 @@ def parse_unified_cells(text: str, is_markdown: bool = False) -> List[dict]:
                 "is_fenced": False,
             })
 
-    return cells
+    # Clean up any isolated divider-only cells by merging them into the subsequent cell
+    cleaned_cells: List[dict] = []
+    ci = 0
+    while ci < len(cells):
+        c = cells[ci]
+        src = c.get("source", "")
+        lines_non_empty = [l for l in src.splitlines() if l.strip()]
+        if len(lines_non_empty) == 1 and BANNER_LINE_RE.match(lines_non_empty[0]) and c.get("cell_type") != "output":
+            if ci + 1 < len(cells):
+                next_c = cells[ci + 1]
+                divider = lines_non_empty[0] + "\n"
+                next_src = next_c.get("source", "")
+                if not next_src.strip().startswith(lines_non_empty[0]):
+                    next_c["source"] = divider + next_src
+                ci += 1
+                continue
+        cleaned_cells.append(c)
+        ci += 1
+
+    return cleaned_cells
 
 
 def has_cell_markers_or_banners(text: str) -> bool:
@@ -511,6 +556,166 @@ def has_cell_markers_or_banners(text: str) -> bool:
     return False
 
 
+def render_cell_outputs_to_text(outputs: list) -> str:
+    """Extract and format textual outputs from notebook cell outputs list."""
+    if not outputs or not isinstance(outputs, list):
+        return ""
+    parts: List[str] = []
+    for out in outputs:
+        if not isinstance(out, dict):
+            continue
+        out_type = str(out.get("output_type", "")).strip()
+        if out_type == "stream":
+            text = out.get("text", "")
+            if isinstance(text, list):
+                text = "".join(str(x) for x in text)
+            if str(text).strip():
+                parts.append(str(text).rstrip("\n"))
+        elif out_type in ("execute_result", "display_data"):
+            data = out.get("data", {})
+            if isinstance(data, dict):
+                text = data.get("text/plain", "")
+                if isinstance(text, list):
+                    text = "".join(str(x) for x in text)
+                if str(text).strip():
+                    parts.append(str(text).rstrip("\n"))
+        elif out_type == "error":
+            ename = str(out.get("ename", "Error"))
+            evalue = str(out.get("evalue", ""))
+            traceback = out.get("traceback", [])
+            if isinstance(traceback, list) and traceback:
+                tb_text = "\n".join(str(t) for t in traceback)
+                parts.append(tb_text)
+            else:
+                parts.append(f"{ename}: {evalue}")
+
+    combined = "\n".join(parts)
+    return ANSI_ESCAPE_RE.sub("", combined)
+
+
+def extract_cell_output_images(outputs: list) -> List[bytes]:
+    """Extract base64-encoded image outputs (PNG/JPEG) from cell outputs."""
+    if not outputs or not isinstance(outputs, list):
+        return []
+    images: List[bytes] = []
+    for out in outputs:
+        if not isinstance(out, dict):
+            continue
+        data = out.get("data", {})
+        if not isinstance(data, dict):
+            continue
+        for mime in ("image/png", "image/jpeg"):
+            if mime in data:
+                b64_data = data[mime]
+                if isinstance(b64_data, list):
+                    b64_data = "".join(str(x) for x in b64_data)
+                try:
+                    img_bytes = base64.b64decode(str(b64_data).strip())
+                    if img_bytes:
+                        images.append(img_bytes)
+                except Exception:
+                    pass
+    return images
+
+
+def parse_ipynb_json_cells(text: str) -> List[dict]:
+    """Parse a Jupyter notebook JSON string into a list of cell dicts, including # %% [output] cells."""
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+
+    if not isinstance(data, dict):
+        return []
+
+    raw_cells = data.get("cells", [])
+    if not isinstance(raw_cells, list):
+        return []
+
+    # Clean up any isolated divider-only cells by merging into the subsequent cell
+    merged_raw_cells = []
+    i = 0
+    while i < len(raw_cells):
+        cell = raw_cells[i]
+        if isinstance(cell, dict):
+            r_src = cell.get("source", "")
+            src_str = "".join(str(s) for s in r_src) if isinstance(r_src, list) else str(r_src)
+            non_empty = [l for l in src_str.splitlines() if l.strip()]
+            if len(non_empty) == 1 and BANNER_LINE_RE.match(non_empty[0]):
+                if i + 1 < len(raw_cells) and isinstance(raw_cells[i + 1], dict):
+                    next_cell = raw_cells[i + 1]
+                    divider = non_empty[0] + "\n"
+                    next_src = next_cell.get("source", "")
+                    next_str = "".join(str(s) for s in next_src) if isinstance(next_src, list) else str(next_src)
+                    if not next_str.strip().startswith(non_empty[0]):
+                        if isinstance(next_cell.get("source"), list):
+                            next_cell["source"] = [divider] + next_cell["source"]
+                        else:
+                            next_cell["source"] = divider + next_str
+                    i += 1
+                    continue
+        merged_raw_cells.append(cell)
+        i += 1
+    raw_cells = merged_raw_cells
+
+    cells = []
+    code_idx = 0
+    for idx, cell in enumerate(raw_cells):
+        if not isinstance(cell, dict):
+            continue
+        ctype = cell.get("cell_type", "code")
+        if ctype not in ("code", "markdown", "raw"):
+            ctype = "code"
+
+        raw_source = cell.get("source", "")
+        if isinstance(raw_source, list):
+            source = "".join(str(s) for s in raw_source)
+        else:
+            source = str(raw_source)
+
+        if not source.endswith("\n") and source:
+            source += "\n"
+
+        if ctype == "code":
+            code_idx += 1
+            lbl = str(code_idx)
+            prefix = "# %%\n"
+        elif ctype == "markdown":
+            lbl = f"MD {len(cells) + 1}"
+            prefix = "# %% [markdown]\n"
+        else:
+            lbl = str(len(cells) + 1)
+            prefix = "# %%\n"
+
+        cells.append({
+            "cell_type": ctype,
+            "source": source,
+            "cell_label": lbl,
+            "hidden_prefix": prefix,
+            "hidden_suffix": "",
+            "is_fenced": False,
+            "execution_count": cell.get("execution_count"),
+        })
+
+        # If code cell has outputs, add output cell right after it with # %% [output]
+        if ctype == "code":
+            outputs = cell.get("outputs", [])
+            out_text = render_cell_outputs_to_text(outputs)
+            if out_text.strip():
+                if not out_text.endswith("\n"):
+                    out_text += "\n"
+                cells.append({
+                    "cell_type": "output",
+                    "source": out_text,
+                    "cell_label": f"{lbl} Out",
+                    "hidden_prefix": "# %% [output]\n",
+                    "hidden_suffix": "",
+                    "is_fenced": False,
+                })
+
+    return cells
+
+
 def parse_quick_paste_cells(text: str) -> List[dict]:
     """
     Parse text pasted into quick paste editor into cells.
@@ -518,6 +723,8 @@ def parse_quick_paste_cells(text: str) -> List[dict]:
     uses parse_unified_cells so each cell is partitioned accurately.
     Falls back to parse_fenced_code_cells only for purely fenced markdown blocks.
     """
+    if is_ipynb_json(text):
+        return parse_ipynb_json_cells(text)
     txt_lines = text.splitlines(keepends=True)
     has_fenced = any(FENCED_CODE_OPEN_RE.match(line.strip()) for line in txt_lines if line.strip())
     if has_fenced:
@@ -536,12 +743,30 @@ def convert_cells_to_ipynb_dict(cells: List[dict]) -> dict:
     ipynb_cells = []
     for cell in cells:
         ctype = cell.get("cell_type", "code")
-        if ctype not in ("code", "markdown", "raw"):
-            ctype = "code"
         src = cell.get("source", "")
         lines = [line if line.endswith("\n") else line + "\n" for line in src.splitlines(keepends=True)]
         if not lines:
             lines = ["\n"]
+
+        if ctype == "output":
+            # Attach to preceding code cell outputs if available
+            if ipynb_cells and ipynb_cells[-1].get("cell_type") == "code":
+                out_item = {
+                    "output_type": "stream",
+                    "name": "stdout",
+                    "text": lines,
+                }
+                ipynb_cells[-1]["outputs"].append(out_item)
+            else:
+                ipynb_cells.append({
+                    "cell_type": "raw",
+                    "metadata": {},
+                    "source": lines,
+                })
+            continue
+
+        if ctype not in ("code", "markdown", "raw"):
+            ctype = "code"
 
         cell_dict = {
             "cell_type": ctype,
@@ -549,8 +774,8 @@ def convert_cells_to_ipynb_dict(cells: List[dict]) -> dict:
             "source": lines,
         }
         if ctype == "code":
-            cell_dict["execution_count"] = None
-            cell_dict["outputs"] = []
+            cell_dict["execution_count"] = cell.get("execution_count")
+            cell_dict["outputs"] = cell.get("outputs", [])
         ipynb_cells.append(cell_dict)
 
     return {
@@ -594,7 +819,12 @@ def convert_cells_to_py_text(cells: List[dict]) -> str:
             or first_line.startswith("# Cell")
         )
         if not has_marker:
-            prefix = "# %% [markdown]\n" if ctype == "markdown" else "# %%\n"
+            if ctype == "output":
+                prefix = "# %% [output]\n"
+            elif ctype == "markdown":
+                prefix = "# %% [markdown]\n"
+            else:
+                prefix = "# %%\n"
             py_parts.append(prefix + src + "\n")
         else:
             py_parts.append(src + "\n")
@@ -1215,7 +1445,7 @@ def get_theme_stylesheet(mode: str) -> str:
         }
 
         /* Surfaces & Rounded Containers */
-        QFrame#topBar, QFrame#navSidebar, QFrame#deckCard, QFrame#workflowBar, QFrame#viewerCard, QFrame#outputCard {
+        QFrame#topBar, QFrame#navSidebar, QFrame#deckCard, QFrame#workflowBar, QFrame#viewerCard, QFrame#outputCard, QFrame#jupiterToolbar, QFrame#jupiterCell {
             background-color: #121722;
             border: 1px solid #1f2737;
             border-radius: 8px;
@@ -1325,6 +1555,25 @@ def get_theme_stylesheet(mode: str) -> str:
             color: #ff7d75;
         }
 
+        QFrame#jupiterToolbar QPushButton {
+            padding: 3px 8px;
+            font-size: 11px;
+            min-height: 20px;
+        }
+
+        QFrame#jupiterCellHeader {
+            background-color: #151b28;
+            border-bottom: 1px solid #1f2737;
+            border-top-left-radius: 7px;
+            border-top-right-radius: 7px;
+        }
+
+        QFrame#jupiterCellHeader QPushButton {
+            padding: 2px 6px;
+            font-size: 11px;
+            min-height: 20px;
+        }
+
         /* Inputs & SpinBoxes */
         QLineEdit, QSpinBox, QComboBox {
             background-color: #0e121a;
@@ -1387,7 +1636,7 @@ def get_theme_stylesheet(mode: str) -> str:
         }
 
         /* Surfaces & Rounded Containers */
-        QFrame#topBar, QFrame#navSidebar, QFrame#deckCard, QFrame#workflowBar, QFrame#viewerCard, QFrame#outputCard {
+        QFrame#topBar, QFrame#navSidebar, QFrame#deckCard, QFrame#workflowBar, QFrame#viewerCard, QFrame#outputCard, QFrame#jupiterToolbar, QFrame#jupiterCell {
             background-color: #ffffff;
             border: 1px solid #d9e1ec;
             border-radius: 8px;
@@ -1495,6 +1744,25 @@ def get_theme_stylesheet(mode: str) -> str:
             background-color: #feeceb;
             border-color: #cc292b;
             color: #a0181a;
+        }
+
+        QFrame#jupiterToolbar QPushButton {
+            padding: 3px 8px;
+            font-size: 11px;
+            min-height: 20px;
+        }
+
+        QFrame#jupiterCellHeader {
+            background-color: #f1f5fa;
+            border-bottom: 1px solid #d9e1ec;
+            border-top-left-radius: 7px;
+            border-top-right-radius: 7px;
+        }
+
+        QFrame#jupiterCellHeader QPushButton {
+            padding: 2px 6px;
+            font-size: 11px;
+            min-height: 20px;
         }
 
         /* Inputs & SpinBoxes */
@@ -1639,6 +1907,89 @@ class CodeEditorWithLineNumbers(QPlainTextEdit):
 
 
 # --------------------------------------------------
+# Responsive Flow Layout
+# --------------------------------------------------
+class FlowLayout(QLayout):
+    """A layout that arranges child widgets horizontally and wraps them into subsequent lines."""
+
+    def __init__(self, parent=None, margin: int = 0, spacing: int = 4):
+        super().__init__(parent)
+        self.item_list: List[any] = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    def addItem(self, item):
+        self.item_list.append(item)
+
+    def count(self) -> int:
+        return len(self.item_list)
+
+    def itemAt(self, index: int):
+        if 0 <= index < len(self.item_list):
+            return self.item_list[index]
+        return None
+
+    def takeAt(self, index: int):
+        if 0 <= index < len(self.item_list):
+            return self.item_list.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), apply_geometry=False)
+
+    def setGeometry(self, rect: QRect):
+        super().setGeometry(rect)
+        self._do_layout(rect, apply_geometry=True)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self.item_list:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect: QRect, apply_geometry: bool) -> int:
+        margins = self.contentsMargins()
+        eff_rect = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x = eff_rect.x()
+        y = eff_rect.y()
+        line_height = 0
+        spacing = self.spacing()
+
+        for item in self.item_list:
+            wid = item.widget()
+            if wid and wid.isHidden():
+                continue
+            hint = item.sizeHint()
+            item_w = hint.width()
+            item_h = hint.height()
+            next_x = x + item_w + spacing
+            if next_x - spacing > eff_rect.right() and line_height > 0:
+                x = eff_rect.x()
+                y = y + line_height + spacing
+                next_x = x + item_w + spacing
+                line_height = 0
+
+            if apply_geometry:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+
+            x = next_x
+            line_height = max(line_height, item_h)
+
+        return y + line_height - eff_rect.y() + margins.bottom()
+
+
+# --------------------------------------------------
 # Jupyter-Style Cell Renderer Widgets
 # --------------------------------------------------
 class JupiterCellWidget(QFrame):
@@ -1675,14 +2026,24 @@ class JupiterCellWidget(QFrame):
 
         cell_type = cell_data.get("cell_type", "code")
         label_text = cell_data.get("cell_label", str(index + 1))
-        type_badge = "Code" if cell_type == "code" else "Markdown"
+        if cell_type == "code":
+            type_badge = "Code"
+            badge_color = "#2d7ff9"
+        elif cell_type == "markdown":
+            type_badge = "Markdown"
+            badge_color = "#18a058"
+        elif cell_type == "output":
+            type_badge = "Output"
+            badge_color = "#d29922"
+        else:
+            type_badge = cell_type.capitalize()
+            badge_color = "#7e8b9b"
 
         self.label = QLabel(f"<b>Cell {label_text}</b>")
         header_layout.addWidget(self.label)
 
         badge = QLabel(type_badge)
         badge.setObjectName("cellTypeBadge")
-        badge_color = "#2d7ff9" if cell_type == "code" else "#18a058"
         badge.setStyleSheet(
             f"background: {badge_color}; color: white; padding: 1px 8px; "
             f"border-radius: 4px; font-size: 11px; font-weight: 600;"
@@ -1712,20 +2073,22 @@ class JupiterCellWidget(QFrame):
 
         up_btn = QPushButton("▲")
         up_btn.setFixedSize(28, 24)
+        up_btn.setStyleSheet("padding: 0px; font-size: 11px;")
         up_btn.setToolTip("Move cell up")
         up_btn.clicked.connect(lambda: self.move_up_signal.emit(self))
         header_layout.addWidget(up_btn)
 
         down_btn = QPushButton("▼")
         down_btn.setFixedSize(28, 24)
+        down_btn.setStyleSheet("padding: 0px; font-size: 11px;")
         down_btn.setToolTip("Move cell down")
         down_btn.clicked.connect(lambda: self.move_down_signal.emit(self))
         header_layout.addWidget(down_btn)
 
         del_btn = QPushButton("✕")
         del_btn.setFixedSize(28, 24)
-        del_btn.setToolTip("Delete cell (can be undone with Undo Delete)")
-        del_btn.setStyleSheet("color: #e05252; font-weight: bold;")
+        del_btn.setToolTip("Delete cell (can be undone with Undo)")
+        del_btn.setStyleSheet("padding: 0px; color: #e05252; font-weight: bold; font-size: 11px;")
         del_btn.clicked.connect(lambda: self.delete_signal.emit(self))
         header_layout.addWidget(del_btn)
 
@@ -1739,9 +2102,24 @@ class JupiterCellWidget(QFrame):
 
         from PyQt6.QtGui import QFontDatabase
         font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
-        font.setPointSize(11)
+        font.setPointSize(10 if cell_type == "output" else 11)
         self.editor.setFont(font)
         self.editor.document().setDefaultFont(font)
+
+        if cell_type == "output":
+            is_dark = self.palette().window().color().lightness() < 128
+            out_bg = "#0f141c" if is_dark else "#f6f8fa"
+            out_fg = "#c5d1de" if is_dark else "#24292f"
+            out_border = "#252d3d" if is_dark else "#d0d7de"
+            self.editor.setStyleSheet(
+                f"QPlainTextEdit {{ "
+                f"  background: {out_bg}; "
+                f"  color: {out_fg}; "
+                f"  border: 1px solid {out_border}; "
+                f"  border-radius: 4px; "
+                f"  padding: 4px; "
+                f"}}"
+            )
 
         self._adjust_editor_height()
         self.editor.textChanged.connect(self._adjust_editor_height)
@@ -1751,7 +2129,8 @@ class JupiterCellWidget(QFrame):
     def _adjust_editor_height(self):
         line_count = max(2, self.editor.toPlainText().count("\n") + 1)
         line_height = self.editor.fontMetrics().lineSpacing()
-        self.editor.setFixedHeight(min(line_count * line_height + 16, 400))
+        max_h = 280 if self.cell_data.get("cell_type") == "output" else 400
+        self.editor.setFixedHeight(min(line_count * line_height + 16, max_h))
 
     def update_index(self, index: int):
         self.cell_index = index
@@ -1811,6 +2190,13 @@ class JupiterCellWidget(QFrame):
             return prefix + body + suffix
 
         # Unified cell / marker cell formatting
+        if not prefix:
+            if self.cell_data.get("cell_type") == "output":
+                prefix = "# %% [output]\n"
+            elif self.cell_data.get("cell_type") == "markdown":
+                prefix = "# %% [markdown]\n"
+            else:
+                prefix = "# %%\n"
         body = text
         if suffix and not body.endswith("\n"):
             body = body + "\n"
@@ -1823,7 +2209,7 @@ class JupiterCellWidget(QFrame):
         return self.select_cb.isChecked()
 
     def get_cell_dict(self) -> dict:
-        return {
+        d = {
             "cell_type": self.cell_data.get("cell_type", "code"),
             "source": self.editor.toPlainText(),
             "cell_label": self.cell_data.get("cell_label", str(self.cell_index + 1)),
@@ -1831,12 +2217,18 @@ class JupiterCellWidget(QFrame):
             "hidden_suffix": self.hidden_suffix,
             "is_fenced": self.is_fenced,
         }
+        if "outputs" in self.cell_data:
+            d["outputs"] = self.cell_data["outputs"]
+        if "execution_count" in self.cell_data:
+            d["execution_count"] = self.cell_data["execution_count"]
+        return d
 
 
 class JupiterNotebookView(QWidget):
     """Scrollable Jupyter-style cell list with toolbar."""
     back_to_editor_signal = pyqtSignal(str)
     find_requested = pyqtSignal()
+    import_requested = pyqtSignal()
 
     def __init__(self, cells: List[dict], parent=None):
         super().__init__(parent)
@@ -1846,74 +2238,95 @@ class JupiterNotebookView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        # --- Toolbar ---
-        toolbar = QHBoxLayout()
-        toolbar.setContentsMargins(4, 4, 4, 4)
-        toolbar.setSpacing(6)
+        # --- Toolbar Frame ---
+        toolbar_frame = QFrame()
+        toolbar_frame.setObjectName("jupiterToolbar")
+        toolbar_layout = QVBoxLayout(toolbar_frame)
+        toolbar_layout.setContentsMargins(6, 6, 6, 6)
+        toolbar_layout.setSpacing(4)
+
+        # Top Bar: Back to Editor + Cell Counter
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.setSpacing(6)
+
+        back_btn = QPushButton("◀ Back to Editor")
+        back_btn.setToolTip("Return to raw text editor (syncs all edits and new cells)")
+        back_btn.clicked.connect(self._go_back)
+        top_bar.addWidget(back_btn)
+
+        top_bar.addStretch()
+
+        cell_count_label = QLabel(f"{len(cells)} cells")
+        cell_count_label.setStyleSheet("color: #7e8b9b; font-size: 11px; font-weight: 500;")
+        top_bar.addWidget(cell_count_label)
+        self.cell_count_label = cell_count_label
+
+        toolbar_layout.addLayout(top_bar)
+
+        # Action Buttons wrapped dynamically in FlowLayout
+        actions_widget = QWidget()
+        flow = FlowLayout(actions_widget, margin=0, spacing=4)
 
         self.select_all_cb = QCheckBox("Select All")
         self.select_all_cb.stateChanged.connect(self._toggle_select_all)
-        toolbar.addWidget(self.select_all_cb)
+        flow.addWidget(self.select_all_cb)
 
         copy_selected_btn = QPushButton("Copy Selected")
         copy_selected_btn.setObjectName("primaryActionBtn")
         copy_selected_btn.clicked.connect(self._copy_selected)
-        toolbar.addWidget(copy_selected_btn)
+        flow.addWidget(copy_selected_btn)
 
-        # Add Code / Markdown at end buttons
-        add_code_btn = QPushButton("+ Code Cell")
+        add_code_btn = QPushButton("+ Code")
         add_code_btn.setToolTip("Add a new code cell at the bottom")
         add_code_btn.clicked.connect(lambda: self._add_cell(cell_type="code"))
-        toolbar.addWidget(add_code_btn)
+        flow.addWidget(add_code_btn)
 
-        add_md_btn = QPushButton("+ Markdown Cell")
+        add_md_btn = QPushButton("+ Markdown")
         add_md_btn.setToolTip("Add a new markdown cell at the bottom")
         add_md_btn.clicked.connect(lambda: self._add_cell(cell_type="markdown"))
-        toolbar.addWidget(add_md_btn)
+        flow.addWidget(add_md_btn)
 
-        # Undo Delete Button
-        self.undo_delete_btn = QPushButton("↺ Undo Delete")
+        self.undo_delete_btn = QPushButton("↺ Undo")
         self.undo_delete_btn.setToolTip("Restore recently deleted cell (Cmd+Z / Ctrl+Z)")
         self.undo_delete_btn.setEnabled(False)
         self.undo_delete_btn.clicked.connect(self._undo_delete_cell)
-        toolbar.addWidget(self.undo_delete_btn)
+        flow.addWidget(self.undo_delete_btn)
 
-        # Show / Hide Syntax Markers Toggle Button
         self.toggle_markers_btn = QPushButton("Show Markers")
         self.toggle_markers_btn.setCheckable(True)
         self.toggle_markers_btn.setToolTip("Toggle visibility of # %%, ```python, and cell markers in editor cards")
         self.toggle_markers_btn.clicked.connect(self._toggle_markers_visibility)
-        toolbar.addWidget(self.toggle_markers_btn)
+        flow.addWidget(self.toggle_markers_btn)
 
-        # Find & Replace in Notebook
+        self.clear_outputs_btn = QPushButton("🗑 Clear Outputs")
+        self.clear_outputs_btn.setToolTip("Delete all output cells from the notebook (can be undone with Undo)")
+        self.clear_outputs_btn.setStyleSheet("color: #e05252;")
+        self.clear_outputs_btn.clicked.connect(self._delete_all_outputs)
+        flow.addWidget(self.clear_outputs_btn)
+
         self.find_btn = QPushButton("🔍 Find")
         self.find_btn.setToolTip("Search and replace across notebook cells (Cmd+F / Ctrl+F)")
         self.find_btn.clicked.connect(lambda: self.find_requested.emit())
-        toolbar.addWidget(self.find_btn)
+        flow.addWidget(self.find_btn)
 
-        # Convert / Export buttons
+        import_ipynb_btn = QPushButton("Import .ipynb")
+        import_ipynb_btn.setToolTip("Import a Jupyter Notebook (.ipynb)")
+        import_ipynb_btn.clicked.connect(lambda: self.import_requested.emit())
+        flow.addWidget(import_ipynb_btn)
+
         export_ipynb_btn = QPushButton("Export .ipynb")
         export_ipynb_btn.setToolTip("Export rendered notebook to a .ipynb Jupyter file")
         export_ipynb_btn.clicked.connect(self._export_ipynb)
-        toolbar.addWidget(export_ipynb_btn)
+        flow.addWidget(export_ipynb_btn)
 
         export_py_btn = QPushButton("Export .py")
         export_py_btn.setToolTip("Export rendered notebook to a partitioned .py Python file")
         export_py_btn.clicked.connect(self._export_py)
-        toolbar.addWidget(export_py_btn)
+        flow.addWidget(export_py_btn)
 
-        toolbar.addStretch()
-
-        cell_count_label = QLabel(f"{len(cells)} cells")
-        cell_count_label.setStyleSheet("color: #7e8b9b; font-size: 12px;")
-        toolbar.addWidget(cell_count_label)
-        self.cell_count_label = cell_count_label
-
-        back_btn = QPushButton("◀ Back to Editor")
-        back_btn.clicked.connect(self._go_back)
-        toolbar.addWidget(back_btn)
-
-        layout.addLayout(toolbar)
+        toolbar_layout.addWidget(actions_widget)
+        layout.addWidget(toolbar_frame)
 
         # --- Scrollable Cell List ---
         self.scroll = QScrollArea()
@@ -1944,6 +2357,24 @@ class JupiterNotebookView(QWidget):
         self.cell_widgets.insert(index, cw)
         self._rebuild_layout()
         return cw
+
+    def _delete_all_outputs(self):
+        """Remove all output cells from the notebook view."""
+        output_widgets = [cw for cw in self.cell_widgets if cw.cell_data.get("cell_type") == "output"]
+        if not output_widgets:
+            return
+
+        batch = []
+        for cw in output_widgets:
+            idx = self.cell_widgets.index(cw)
+            batch.append((idx, cw.get_cell_dict()))
+            self.cell_widgets.remove(cw)
+            self.cell_layout.removeWidget(cw)
+            cw.deleteLater()
+
+        self._deleted_cells_history.append(batch)
+        self._rebuild_layout()
+        self._update_undo_button()
 
     def _rebuild_layout(self):
         while self.cell_layout.count():
@@ -2071,11 +2502,11 @@ class JupiterNotebookView(QWidget):
         count = len(self._deleted_cells_history)
         if count > 0:
             self.undo_delete_btn.setEnabled(True)
-            self.undo_delete_btn.setText(f"↺ Undo Delete ({count})")
+            self.undo_delete_btn.setText(f"↺ Undo ({count})")
             self.undo_delete_btn.setToolTip(f"Restore recently deleted cell ({count} in history, Cmd+Z / Ctrl+Z)")
         else:
             self.undo_delete_btn.setEnabled(False)
-            self.undo_delete_btn.setText("↺ Undo Delete")
+            self.undo_delete_btn.setText("↺ Undo")
             self.undo_delete_btn.setToolTip("No deleted cells to restore")
 
     def _go_back(self):
@@ -2498,30 +2929,53 @@ class PyToTextMainWindow(QMainWindow):
         )
         editor_layout.addWidget(self.paste_text_edit, 1)
 
-        bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(6)
+        bottom_box = QVBoxLayout()
+        bottom_box.setContentsMargins(0, 0, 0, 0)
+        bottom_box.setSpacing(4)
+
+        # Tier 1: Character/Token Stats + Clear
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(6)
+
         self.paste_stats_label = QLabel("0 chars · 0 tokens")
         self.paste_stats_label.setStyleSheet("color: #7e8b9b;")
-        bottom_row.addWidget(self.paste_stats_label)
+        row1.addWidget(self.paste_stats_label)
 
-        bottom_row.addStretch()
+        row1.addStretch()
+
+        clear_paste_btn = QPushButton("Clear")
+        clear_paste_btn.setObjectName("clearBtn")
+        clear_paste_btn.clicked.connect(lambda: self.paste_text_edit.clear())
+        row1.addWidget(clear_paste_btn)
+
+        bottom_box.addLayout(row1)
+
+        # Tier 2: Action Buttons wrapped dynamically in FlowLayout
+        actions_widget = QWidget()
+        flow = FlowLayout(actions_widget, margin=0, spacing=4)
 
         # Find & Replace in quick paste
         self.quick_find_toggle_btn = QPushButton("🔍 Find")
         self.quick_find_toggle_btn.setToolTip("Find and Replace in quick paste (Cmd+F / Ctrl+F)")
         self.quick_find_toggle_btn.clicked.connect(self._toggle_quick_find_bar)
-        bottom_row.addWidget(self.quick_find_toggle_btn)
+        flow.addWidget(self.quick_find_toggle_btn)
 
-        # Export buttons
+        # Import / Export buttons
+        self.quick_import_ipynb_btn = QPushButton("Import .ipynb")
+        self.quick_import_ipynb_btn.setToolTip("Import a Jupyter Notebook file (.ipynb) and render as cells")
+        self.quick_import_ipynb_btn.clicked.connect(self._import_quick_paste_ipynb)
+        flow.addWidget(self.quick_import_ipynb_btn)
+
         self.quick_export_ipynb_btn = QPushButton("Export .ipynb")
         self.quick_export_ipynb_btn.setToolTip("Export quick paste buffer as Jupyter Notebook (.ipynb)")
         self.quick_export_ipynb_btn.clicked.connect(self._export_quick_paste_ipynb)
-        bottom_row.addWidget(self.quick_export_ipynb_btn)
+        flow.addWidget(self.quick_export_ipynb_btn)
 
         self.quick_export_py_btn = QPushButton("Export .py")
         self.quick_export_py_btn.setToolTip("Export quick paste buffer as Python file (.py)")
         self.quick_export_py_btn.clicked.connect(self._export_quick_paste_py)
-        bottom_row.addWidget(self.quick_export_py_btn)
+        flow.addWidget(self.quick_export_py_btn)
 
         # Render Jupyter button (hidden by default, shown when markers detected)
         self.render_jupyter_btn = QPushButton("Render Jupyter")
@@ -2529,15 +2983,12 @@ class PyToTextMainWindow(QMainWindow):
         self.render_jupyter_btn.setToolTip("Render as Jupyter-style cells")
         self.render_jupyter_btn.setVisible(False)
         self.render_jupyter_btn.clicked.connect(self._render_jupyter_view)
-        bottom_row.addWidget(self.render_jupyter_btn)
+        flow.addWidget(self.render_jupyter_btn)
 
-        clear_paste_btn = QPushButton("Clear")
-        clear_paste_btn.setObjectName("clearBtn")
-        clear_paste_btn.clicked.connect(lambda: self.paste_text_edit.clear())
-        bottom_row.addWidget(clear_paste_btn)
+        bottom_box.addWidget(actions_widget)
 
         self.paste_text_edit.textChanged.connect(self._update_paste_stats)
-        editor_layout.addLayout(bottom_row)
+        editor_layout.addLayout(bottom_box)
 
         self.paste_stack.addWidget(editor_page)
 
@@ -2584,7 +3035,8 @@ class PyToTextMainWindow(QMainWindow):
         r1.addWidget(self.quick_chk_case)
 
         close_btn = QPushButton("✕")
-        close_btn.setFixedWidth(24)
+        close_btn.setFixedSize(24, 24)
+        close_btn.setStyleSheet("padding: 0px; font-size: 11px;")
         close_btn.clicked.connect(lambda: self.quick_find_replace_bar.hide())
         r1.addWidget(close_btn)
         layout.addLayout(r1)
@@ -2928,7 +3380,8 @@ class PyToTextMainWindow(QMainWindow):
         r1.addWidget(self.chk_match_case)
 
         close_btn = QPushButton("✕")
-        close_btn.setFixedWidth(24)
+        close_btn.setFixedSize(24, 24)
+        close_btn.setStyleSheet("padding: 0px; font-size: 11px;")
         close_btn.clicked.connect(lambda: self.find_replace_widget.hide())
         r1.addWidget(close_btn)
         layout.addLayout(r1)
@@ -3791,10 +4244,26 @@ class PyToTextMainWindow(QMainWindow):
         if not txt.strip():
             return
 
+        # If user switched back to editor without changing text, reuse active notebook view
+        if (
+            hasattr(self, "_last_reconstructed_text")
+            and txt == self._last_reconstructed_text
+            and self.paste_stack.widget(1)
+            and isinstance(self.paste_stack.widget(1), JupiterNotebookView)
+        ):
+            self.paste_stack.setCurrentIndex(1)
+            if hasattr(self, "quick_find_replace_bar") and self.quick_find_replace_bar.isVisible():
+                self._on_quick_find_text_changed()
+            return
+
         cells = parse_quick_paste_cells(txt)
         if not cells:
             return
 
+        self._render_jupyter_view_with_cells(cells)
+
+    def _render_jupyter_view_with_cells(self, cells: List[dict]):
+        """Render given cell dictionaries and switch to Jupyter notebook view."""
         # Remove old notebook view if any
         old_widget = self.paste_stack.widget(1)
         if old_widget:
@@ -3805,6 +4274,7 @@ class PyToTextMainWindow(QMainWindow):
         notebook_view = JupiterNotebookView(cells)
         notebook_view.back_to_editor_signal.connect(self._back_to_editor)
         notebook_view.find_requested.connect(self._open_quick_find_bar)
+        notebook_view.import_requested.connect(self._import_quick_paste_ipynb)
         self.paste_stack.insertWidget(1, notebook_view)
         self.paste_stack.setCurrentIndex(1)
         if hasattr(self, "quick_find_replace_bar") and self.quick_find_replace_bar.isVisible():
@@ -3812,6 +4282,7 @@ class PyToTextMainWindow(QMainWindow):
 
     def _back_to_editor(self, reconstructed_text: str):
         """Switch from Jupyter view back to raw text editor."""
+        self._last_reconstructed_text = reconstructed_text
         self.paste_text_edit.setPlainText(reconstructed_text)
         self.paste_stack.setCurrentIndex(0)
         if hasattr(self, "quick_find_replace_bar") and self.quick_find_replace_bar.isVisible():
@@ -4055,6 +4526,30 @@ class PyToTextMainWindow(QMainWindow):
             self._on_quick_find_text_changed()
         else:
             self.statusBar().showMessage(f"No occurrences of '{query}' found.", 2500)
+
+    def _import_quick_paste_ipynb(self, file_path: Optional[str | Path] = None):
+        """Import a Jupyter Notebook file (.ipynb) and render cells in quick paste view."""
+        if not file_path or not isinstance(file_path, (str, Path)):
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Import Jupyter Notebook", "", "Jupyter Notebook (*.ipynb);;All Files (*)"
+            )
+        if not file_path:
+            return
+
+        try:
+            content = Path(file_path).read_text(encoding="utf-8")
+            cells = parse_ipynb_json_cells(content)
+            if not cells:
+                QMessageBox.warning(self, "Empty Notebook", f"No cells found in notebook:\n{file_path}")
+                return
+
+            py_text = convert_cells_to_py_text(cells)
+            self._last_reconstructed_text = py_text
+            self.paste_text_edit.setPlainText(py_text)
+            self._render_jupyter_view_with_cells(cells)
+            self.statusBar().showMessage(f"Imported {len(cells)} cells from {Path(file_path).name}", 4000)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Failed", f"Failed to import Jupyter Notebook:\n{e}")
 
     def _export_quick_paste_ipynb(self):
         if self.paste_stack.currentIndex() == 1:
@@ -4331,8 +4826,9 @@ class PyToTextMainWindow(QMainWindow):
         header.addStretch()
 
         if part_num < total_parts:
-            next_btn = QPushButton(f"Copy & Next ➔ (Part {part_num + 1})")
+            next_btn = QPushButton(f"Copy & Next (Part {part_num + 1})")
             next_btn.setObjectName("accentBtn")
+            next_btn.setToolTip(f"Copy this part to clipboard and switch to Part {part_num + 1}")
             next_btn.clicked.connect(lambda _, c=content, b=next_btn, idx=part_num: self._copy_and_switch_next(c, b, idx))
             header.addWidget(next_btn)
 
