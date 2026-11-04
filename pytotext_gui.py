@@ -1561,6 +1561,34 @@ def get_theme_stylesheet(mode: str) -> str:
             min-height: 20px;
         }
 
+        QFrame#jupiterToolbar QPushButton#jupiterSelectMenuBtn::menu-indicator {
+            width: 0px;
+            height: 0px;
+            image: none;
+        }
+
+        QMenu {
+            background-color: #121722;
+            color: #d6deeb;
+            border: 1px solid #1f2737;
+            border-radius: 6px;
+            padding: 4px;
+        }
+        QMenu::item {
+            padding: 5px 20px 5px 12px;
+            border-radius: 4px;
+            font-size: 11.5px;
+        }
+        QMenu::item:selected {
+            background-color: #1a2233;
+            color: #58a6ff;
+        }
+        QMenu::separator {
+            height: 1px;
+            background-color: #1f2737;
+            margin: 4px 6px;
+        }
+
         QFrame#jupiterCellHeader {
             background-color: #151b28;
             border-bottom: 1px solid #1f2737;
@@ -1750,6 +1778,34 @@ def get_theme_stylesheet(mode: str) -> str:
             padding: 3px 8px;
             font-size: 11px;
             min-height: 20px;
+        }
+
+        QFrame#jupiterToolbar QPushButton#jupiterSelectMenuBtn::menu-indicator {
+            width: 0px;
+            height: 0px;
+            image: none;
+        }
+
+        QMenu {
+            background-color: #ffffff;
+            color: #1b212d;
+            border: 1px solid #d9e1ec;
+            border-radius: 6px;
+            padding: 4px;
+        }
+        QMenu::item {
+            padding: 5px 20px 5px 12px;
+            border-radius: 4px;
+            font-size: 11.5px;
+        }
+        QMenu::item:selected {
+            background-color: #eaf1fb;
+            color: #0969da;
+        }
+        QMenu::separator {
+            height: 1px;
+            background-color: #e5ebf3;
+            margin: 4px 6px;
         }
 
         QFrame#jupiterCellHeader {
@@ -2268,9 +2324,47 @@ class JupiterNotebookView(QWidget):
         actions_widget = QWidget()
         flow = FlowLayout(actions_widget, margin=0, spacing=4)
 
-        self.select_all_cb = QCheckBox("Select All")
-        self.select_all_cb.stateChanged.connect(self._toggle_select_all)
-        flow.addWidget(self.select_all_cb)
+        self.select_btn = QPushButton("Select All ▾")
+        self.select_btn.setObjectName("jupiterSelectMenuBtn")
+        self.select_btn.setToolTip("Select notebook cells by type or filter")
+
+        select_menu = QMenu(self.select_btn)
+
+        act_all = select_menu.addAction("Select All")
+        act_all.setToolTip("Select all cells and outputs")
+        act_all.triggered.connect(self._select_all_cells)
+
+        act_all_cells = select_menu.addAction("Select All Cells (Code & Markdown)")
+        act_all_cells.setToolTip("Select all code and markdown cells (excluding outputs)")
+        act_all_cells.triggered.connect(lambda: self._select_cells_by_types({"code", "markdown"}))
+
+        act_code = select_menu.addAction("Select All Code Cells")
+        act_code.setToolTip("Select only Python code cells")
+        act_code.triggered.connect(lambda: self._select_cells_by_type("code"))
+
+        act_md = select_menu.addAction("Select All Markdown Cells")
+        act_md.setToolTip("Select only Markdown documentation cells")
+        act_md.triggered.connect(lambda: self._select_cells_by_type("markdown"))
+
+        act_out = select_menu.addAction("Select All Output Cells")
+        act_out.setToolTip("Select only terminal and execution output cells")
+        act_out.triggered.connect(lambda: self._select_cells_by_type("output"))
+
+        select_menu.addSeparator()
+
+        act_invert = select_menu.addAction("Invert Selection")
+        act_invert.setToolTip("Invert current selection across all cells")
+        act_invert.triggered.connect(self._invert_cell_selection)
+
+        act_none = select_menu.addAction("Deselect All")
+        act_none.setToolTip("Clear all cell selections")
+        act_none.triggered.connect(self._deselect_all_cells)
+
+        self.select_btn.setMenu(select_menu)
+        flow.addWidget(self.select_btn)
+
+        # Backwards compatibility alias
+        self.select_all_cb = self.select_btn
 
         copy_selected_btn = QPushButton("Copy Selected")
         copy_selected_btn.setObjectName("primaryActionBtn")
@@ -2430,15 +2524,45 @@ class JupiterNotebookView(QWidget):
 
         self._insert_cell_widget(new_data, insert_idx)
 
+    def _select_all_cells(self):
+        for cw in self.cell_widgets:
+            cw.select_cb.setChecked(True)
+
+    def _deselect_all_cells(self):
+        for cw in self.cell_widgets:
+            cw.select_cb.setChecked(False)
+
+    def _select_cells_by_type(self, cell_type: str):
+        for cw in self.cell_widgets:
+            cw.select_cb.setChecked(cw.cell_data.get("cell_type", "code") == cell_type)
+
+    def _select_cells_by_types(self, cell_types: set):
+        for cw in self.cell_widgets:
+            cw.select_cb.setChecked(cw.cell_data.get("cell_type", "code") in cell_types)
+
+    def _invert_cell_selection(self):
+        for cw in self.cell_widgets:
+            cw.select_cb.setChecked(not cw.select_cb.isChecked())
+
     def _toggle_select_all(self, state):
-        checked = state == Qt.CheckState.Checked.value
+        checked = (state == Qt.CheckState.Checked.value) if isinstance(state, int) else bool(state)
         for cw in self.cell_widgets:
             cw.select_cb.setChecked(checked)
 
     def _copy_selected(self):
         selected = [cw.get_content() for cw in self.cell_widgets if cw.is_selected()]
+        sender = self.sender()
         if selected:
             QApplication.clipboard().setText("\n\n".join(selected))
+            if sender:
+                orig_text = sender.text()
+                sender.setText(f"Copied ({len(selected)})!")
+                QTimer.singleShot(1200, lambda: sender.setText(orig_text))
+        else:
+            if sender:
+                orig_text = sender.text()
+                sender.setText("None selected!")
+                QTimer.singleShot(1200, lambda: sender.setText(orig_text))
 
     def _move_cell_up(self, cell_widget: JupiterCellWidget):
         idx = self.cell_widgets.index(cell_widget)
